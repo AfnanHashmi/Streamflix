@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>BigBoss 24hrs — Members Only</title>
+  <meta name="description" content="Access is restricted to group members. Get the access link from the group." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap" rel="stylesheet" />
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --accent:    #e63950;
+      --accent-dim:#8b1a2a;
+      --bg:        #080b10;
+      --surface:   #0e1117;
+      --border:    rgba(255,255,255,0.08);
+      --text:      #e8eaf0;
+      --muted:     #8a90a0;
+    }
+
+    body {
+      font-family: 'Inter', system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 2rem 1.25rem;
+      overflow: hidden;
+      position: relative;
+    }
+
+    /* Ambient glow blobs */
+    body::before, body::after {
+      content: '';
+      position: fixed;
+      border-radius: 50%;
+      filter: blur(120px);
+      pointer-events: none;
+      z-index: 0;
+    }
+    body::before {
+      width: 600px; height: 600px;
+      background: radial-gradient(circle, rgba(230,57,80,0.18) 0%, transparent 70%);
+      top: -200px; left: -150px;
+    }
+    body::after {
+      width: 500px; height: 500px;
+      background: radial-gradient(circle, rgba(100,60,200,0.12) 0%, transparent 70%);
+      bottom: -200px; right: -100px;
+    }
+
+    .card {
+      position: relative;
+      z-index: 1;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      padding: 3rem 2.5rem;
+      max-width: 480px;
+      width: 100%;
+      text-align: center;
+      box-shadow:
+        0 0 0 1px rgba(230,57,80,0.15),
+        0 24px 64px rgba(0,0,0,0.6);
+      animation: fadeUp 0.5s cubic-bezier(0.22,1,0.36,1) both;
+    }
+
+    @keyframes fadeUp {
+      from { opacity: 0; transform: translateY(28px); }
+      to   { opacity: 1; transform: translateY(0);    }
+    }
+
+    .lock-icon {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 72px; height: 72px;
+      border-radius: 50%;
+      background: linear-gradient(135deg, var(--accent-dim), var(--accent));
+      margin-bottom: 1.75rem;
+      box-shadow: 0 0 32px rgba(230,57,80,0.35);
+    }
+
+    .lock-icon svg {
+      width: 32px; height: 32px;
+      fill: #fff;
+    }
+
+    h1 {
+      font-size: 1.6rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      margin-bottom: 0.75rem;
+      background: linear-gradient(135deg, #fff 40%, var(--muted));
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+
+    .subtitle {
+      font-size: 1rem;
+      color: var(--muted);
+      line-height: 1.65;
+      margin-bottom: 2rem;
+    }
+
+    .pill {
+      display: inline-block;
+      background: rgba(230,57,80,0.12);
+      border: 1px solid rgba(230,57,80,0.3);
+      color: #f08090;
+      font-size: 0.85rem;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      padding: 0.45rem 1.1rem;
+      border-radius: 999px;
+    }
+
+    .divider {
+      height: 1px;
+      background: var(--border);
+      margin: 2rem 0;
+    }
+
+    .footer-note {
+      font-size: 0.78rem;
+      color: var(--muted);
+      line-height: 1.5;
+    }
+
+    /* Subtle pulse on the lock icon */
+    .lock-icon {
+      animation: fadeUp 0.5s cubic-bezier(0.22,1,0.36,1) both, pulse 3s ease-in-out 1s infinite;
+    }
+    @keyframes pulse {
+      0%, 100% { box-shadow: 0 0 32px rgba(230,57,80,0.35); }
+      50%       { box-shadow: 0 0 56px rgba(230,57,80,0.55); }
+    }
+  </style>
+</head>
+<body>
+  <div class="card" role="main">
+    <div class="lock-icon" aria-hidden="true">
+      <!-- lock SVG -->
+      <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+        <path d="M18 8h-1V6A5 5 0 0 0 7 6v2H6a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h12a2 2 0 0 0
+                 2-2V10a2 2 0 0 0-2-2zm-6 9a2 2 0 1 1 0-4 2 2 0 0 1 0 4zm3.1-9H8.9V6a3.1 3.1
+                 0 0 1 6.2 0v2z"/>
+      </svg>
+    </div>
+
+    <h1>Members Only</h1>
+    <p class="subtitle">
+      This stream is restricted to group members.<br />
+      The access link is shared in our group&nbsp;— get it there.
+    </p>
+
+    <span class="pill">🔗 Get the link from the group</span>
+
+    <div class="divider"></div>
+
+    <p class="footer-note">
+      Already have a link? Click it to gain access.<br />
+      Links rotate every 18 hours.
+    </p>
+  </div>
+</body>
+</html>

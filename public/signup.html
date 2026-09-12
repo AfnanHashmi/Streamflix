@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Streamflix — Sign Up</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --stage:#080A10; --stage-2:#0D111A;
+    --glass:rgba(255,255,255,0.045); --glass-border:rgba(255,255,255,0.09);
+    --blue:#3E7BFA; --gold:#D8AE44;
+    --text:#EDEFF4; --text-dim:#7C8291; --error:#E24C5C;
+  }
+  *{margin:0;padding:0;box-sizing:border-box;}
+  body{
+    background:linear-gradient(var(--stage), var(--stage-2));
+    color:var(--text); font-family:'Inter',sans-serif;
+    min-height:100vh; display:flex; align-items:center; justify-content:center; padding:20px;
+  }
+  .logo{ display:flex; justify-content:center; align-items:center; font-family:'Space Grotesk',sans-serif; font-weight:600; font-size:22px; margin-bottom:32px; }
+  .logo-x{ font-weight:700; font-style:italic; letter-spacing:-2px;
+    background:linear-gradient(135deg, var(--blue) 10%, var(--gold) 100%);
+    -webkit-background-clip:text; background-clip:text; color:transparent; font-size:27px; margin:0 -1px; }
+  .card{
+    width:100%; max-width:380px; background:var(--glass); border:1px solid var(--glass-border);
+    border-radius:18px; padding:36px 32px; backdrop-filter:blur(20px);
+  }
+  h1{ font-family:'Space Grotesk',sans-serif; font-size:22px; font-weight:600; margin-bottom:6px; text-align:center; }
+  .sub{ font-size:13px; color:var(--text-dim); text-align:center; margin-bottom:28px; }
+  label{ font-size:12.5px; color:var(--text-dim); display:block; margin-bottom:6px; }
+  input{
+    width:100%; padding:12px 14px; margin-bottom:16px; background:rgba(255,255,255,0.04);
+    border:1px solid var(--glass-border); border-radius:10px; color:var(--text); font-size:14px; outline:none;
+    transition:border-color .2s;
+  }
+  input:focus{ border-color:var(--blue); }
+  .hint{ font-size:11px; color:var(--text-dim); margin-top:-10px; margin-bottom:16px; }
+  button{
+    width:100%; padding:13px; border:none; border-radius:10px; font-size:14px; font-weight:600;
+    background:linear-gradient(135deg, var(--blue), #6FA0FF); color:#080A10; cursor:pointer; margin-top:6px;
+    transition:filter .2s;
+  }
+  button:hover{ filter:brightness(1.08); }
+  button:disabled{ opacity:0.6; cursor:not-allowed; }
+  .error-msg{ color:var(--error); font-size:12.5px; margin-bottom:14px; display:none; }
+  .switch{ text-align:center; font-size:13px; color:var(--text-dim); margin-top:20px; }
+  .switch a{ color:var(--blue); text-decoration:none; }
+</style>
+</head>
+<body>
+  <div style="width:100%; max-width:380px;">
+    <div class="logo">Streamflix<span class="logo-x">X</span></div>
+    <div class="card">
+      <h1>Create your account</h1>
+      <div class="sub">Join Streamflix</div>
+      <div class="error-msg" id="errorMsg"></div>
+      <form id="signupForm">
+        <label>Email</label>
+        <input type="email" id="email" required autocomplete="email">
+        <label>Password</label>
+        <input type="password" id="password" required autocomplete="new-password" minlength="8">
+        <div class="hint">At least 8 characters</div>
+        <button type="submit" id="submitBtn">Sign Up</button>
+      </form>
+      <div class="switch">Already have an account? <a href="/login.html">Log in</a></div>
+    </div>
+  </div>
+
+  <script>
+    const form = document.getElementById('signupForm');
+    const errorMsg = document.getElementById('errorMsg');
+    const submitBtn = document.getElementById('submitBtn');
+
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      errorMsg.style.display = 'none';
+      submitBtn.disabled = true;
+      submitBtn.textContent = 'Creating account...';
+
+      try {
+        const res = await fetch('/api/signup', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'include',
+          body: JSON.stringify({
+            email: document.getElementById('email').value,
+            password: document.getElementById('password').value
+          })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Signup failed');
+        window.location.href = '/live';
+      } catch (err) {
+        errorMsg.textContent = err.message;
+        errorMsg.style.display = 'block';
+        submitBtn.disabled = false;
+        submitBtn.textContent = 'Sign Up';
+      }
+    });
+  </script>
+</body>
+</html>
