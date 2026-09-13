@@ -787,7 +787,7 @@ app.delete('/api/polls/:id', requireAuth, requireAdmin, (req, res) => {
 const CLIP_TMP_DIR = '/tmp/streamflix-clips';
 const CLIP_ORIGIN = 'http://127.0.0.1:3333/app';
 const CLIP_STREAM_NAME = 'stream';
-const CLIP_MAX_DURATION_SEC = 30;
+const CLIP_MAX_DURATION_SEC = 60; // was 30 - raised so Share/Download can cover a full Reels/Story-length moment
 const CLIP_MAX_CONCURRENT = 8;
 const CLIP_MAX_QUEUE_DEPTH = 30;
 // Clips vary 13x in size (a 360p preview vs a 30s 1080p download), so a
@@ -797,7 +797,7 @@ const CLIP_MAX_QUEUE_DEPTH = 30;
 // Budgeting by bytes actually served lets a user make many cheap previews OR
 // a few full-quality downloads, whichever they need.
 const CLIP_BYTE_BUDGET_WINDOW_MS = 15 * 60 * 1000;
-const CLIP_BYTE_BUDGET_MAX_BYTES = 150 * 1024 * 1024; // ~10 full 1080p clips, or ~120 preview-quality ones, per 15 min
+const CLIP_BYTE_BUDGET_MAX_BYTES = 300 * 1024 * 1024; // ~9-10 full 60s 1080p clips per 15 min (raised alongside the 60s cap so clip COUNT feels the same as the old 30s/150MB limit)
 
 fs.mkdirSync(CLIP_TMP_DIR, { recursive: true });
 
