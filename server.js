@@ -254,14 +254,10 @@ io.use((socket, next) => {
 
 // 3. Socket.io Connection & History Logic
 let activeViewers = 0;
-let pinnedMessage = null;
 
 io.on('connection', (socket) => {
   activeViewers++;
   io.emit('viewer_count', activeViewers);
-
-  // Send current pinned message state to newly connected client
-  socket.emit('update_pinned_message', pinnedMessage);
 
   socket.on('disconnect', () => {
     activeViewers = Math.max(0, activeViewers - 1);
@@ -313,29 +309,6 @@ io.on('connection', (socket) => {
     } catch (err) {
       console.error('Failed to save chat message:', err);
     }
-  });
-
-  // Handle Pin Message (Admin only)
-  socket.on('pin_message', (data) => {
-    if (!isSenderAdmin) return;
-    if (!data || !data.text || !data.text.trim()) return;
-
-    pinnedMessage = {
-      id: String(data.id || Date.now()),
-      text: data.text.trim(),
-      author: data.author || senderUsername,
-      timestamp: data.timestamp || new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-    };
-
-    io.emit('update_pinned_message', pinnedMessage);
-  });
-
-  // Handle Unpin Message (Admin only)
-  socket.on('unpin_message', () => {
-    if (!isSenderAdmin) return;
-
-    pinnedMessage = null;
-    io.emit('update_pinned_message', null);
   });
 
 });
@@ -593,8 +566,7 @@ app.delete('/api/library/videos/:id', requireAuth, requireAdmin, (req, res) => {
 });
 
 // ---------- Live Polls & Predictions ----------
-// Poll state lives in the DB (unlike pinnedMessage, which is in-memory and is
-// lost on every restart) so polls and votes survive a restart.
+// Poll state lives in the DB, so polls and votes survive a restart.
 
 const POLL_MAX_OPTIONS = 10;
 const POLL_MAX_QUESTION_LEN = 300;
