@@ -469,58 +469,6 @@ app.get('/api/stream-title', (req, res) => {
   }
 });
 
-// ---------- Dynamic Upcoming Stream Schedule ----------
-// GET: Retrieve current schedule (returns array)
-app.get('/api/stream/schedule', (req, res) => {
-  try {
-    const row = db.prepare(`SELECT value FROM settings WHERE key = 'upcoming_stream_schedule'`).get();
-    let schedule = [];
-    if (row && row.value) {
-      try {
-        schedule = JSON.parse(row.value);
-        if (!Array.isArray(schedule)) schedule = [];
-      } catch {
-        schedule = [];
-      }
-    }
-    return res.json({ schedule });
-  } catch (err) {
-    return res.json({ schedule: [] });
-  }
-});
-
-// POST: Update schedule (Admin restricted, accepts array)
-app.post('/api/stream/schedule', requireAuth, requireAdmin, (req, res) => {
-  let { schedule } = req.body || {};
-  if (!Array.isArray(schedule)) {
-    return res.status(400).json({ error: 'Schedule must be an array' });
-  }
-
-  // Validate array items
-  schedule = schedule.map(item => ({
-    id: String(item.id || Date.now() + Math.random().toString(36).substr(2, 5)),
-    title: String(item.title || '').trim(),
-    datetime: String(item.datetime || '')
-  })).filter(item => item.title && item.datetime);
-
-  try {
-    const jsonStr = JSON.stringify(schedule);
-    db.prepare(`
-      INSERT INTO settings (key, value) VALUES ('upcoming_stream_schedule', ?)
-      ON CONFLICT(key) DO UPDATE SET value = excluded.value
-    `).run(jsonStr);
-
-    if (typeof io !== 'undefined') {
-      io.emit('schedule_updated', { schedule });
-    }
-
-    return res.json({ success: true, schedule });
-  } catch (err) {
-    console.error('Failed to save stream schedule:', err);
-    return res.status(500).json({ error: 'Database update failed' });
-  }
-});
-
 // ---------- Library Folders & Videos API ----------
 
 // GET /api/library/folders (Public)
