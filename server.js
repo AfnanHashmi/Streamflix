@@ -151,6 +151,18 @@ try {
   db.exec(`ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'user'`);
 } catch (e) {}
 
+// Multi-poll support: each poll now carries its own fixed lifecycle instead
+// of the old "one poll at a time" model. CREATE TABLE IF NOT EXISTS won't add
+// columns to an already-existing table, so these are guarded the same way as
+// the users.role migration above.
+try {
+  db.exec(`ALTER TABLE polls ADD COLUMN closes_at DATETIME`);
+} catch (e) {}
+try {
+  db.exec(`ALTER TABLE polls ADD COLUMN expires_at DATETIME`);
+} catch (e) {}
+db.exec(`CREATE INDEX IF NOT EXISTS idx_polls_status ON polls(status)`);
+
 // ---------- Access-token system ----------
 // Registers /access, /admin/current-link, and starts the 18h rotation.
 // Uses the same db, jwt, JWT_SECRET, and IS_PROD already established above.
@@ -182,11 +194,120 @@ function cleanupOldMessages() {
 cleanupOldMessages();
 setInterval(cleanupOldMessages, 60 * 60 * 1000);
 
-// Default title if none set yet
-const existingTitle = db.prepare('SELECT value FROM stream_meta WHERE key = ?').get('stream_title');
-if (!existingTitle) {
-  db.prepare('INSERT INTO stream_meta (key, value) VALUES (?, ?)').run('stream_title', 'Live Stream');
+// ---------- Auto title schedule ----------
+// The channel name auto-switches for the nightly episode window, and resets
+// the moment a live stream ends. IST has no DST and is a fixed UTC+5:30, so
+// shifting the epoch and reading the UTC getters is safe with no date library
+// (accessTokens.js's getMsUntilNext1130PMUTC does the same kind of manual math).
+const TITLE_DEFAULT = '24Hrs Channel';
+const TITLE_EPISODE = 'Bigg Boss 20 Episode';
+const TITLE_WKW = 'Bigg Boss WKW';
+const TITLE_WINDOW_START_MIN = 21 * 60;       // 21:00 IST
+const TITLE_WINDOW_END_MIN = 22 * 60 + 30;    // 22:30 IST
+
+function scheduledTitleState(now = new Date()) {
+  const ist = new Date(now.getTime() + 5.5 * 3600 * 1000);
+  const mins = ist.getUTCHours() * 60 + ist.getUTCMinutes();
+  if (mins < TITLE_WINDOW_START_MIN || mins >= TITLE_WINDOW_END_MIN) return 'default';
+  const day = ist.getUTCDay(); // 0 Sun ... 6 Sat
+  return (day === 0 || day === 6) ? 'wkw' : 'episode';
 }
+
+function titleForState(state) {
+  if (state === 'episode') return TITLE_EPISODE;
+  if (state === 'wkw') return TITLE_WKW;
+  return TITLE_DEFAULT;
+}
+
+// Shared by the schedule sweep and the stream-liveness sweep below. Only
+// writes/emits when the title actually changes, matching the "log only when
+// something changed" house pattern from cleanupOldMessages().
+function applyTitle(newTitle, reason) {
+  const row = db.prepare(`SELECT value FROM settings WHERE key = 'stream_title'`).get();
+  if (row && row.value === newTitle) return false;
+  db.prepare(`
+    INSERT INTO settings (key, value) VALUES ('stream_title', ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+  `).run(newTitle);
+  if (typeof io !== 'undefined') {
+    io.emit('stream_title_updated', { title: newTitle });
+  }
+  console.log(`[Title] -> "${newTitle}" (${reason})`);
+  return true;
+}
+
+// Seed the default title if none is set yet (first boot).
+const existingTitle = db.prepare(`SELECT value FROM settings WHERE key = 'stream_title'`).get();
+if (!existingTitle) {
+  applyTitle(TITLE_DEFAULT, 'initial seed');
+}
+
+// Reconciles the persisted schedule state against the computed one every
+// minute rather than firing on a cron edge, so a missed tick or a restart
+// self-heals instead of losing the boundary. Only acts at a boundary - a
+// manual title set by an admin, or a stream-end reset, survives untouched
+// between boundaries because nothing here writes unless the state changed.
+function sweepTitleSchedule() {
+  try {
+    const computed = scheduledTitleState();
+    const row = db.prepare(`SELECT value FROM settings WHERE key = 'title_schedule_state'`).get();
+    const persisted = row ? row.value : null;
+    if (computed === persisted) return;
+
+    db.prepare(`
+      INSERT INTO settings (key, value) VALUES ('title_schedule_state', ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    `).run(computed);
+    applyTitle(titleForState(computed), `schedule -> ${computed}`);
+  } catch (err) {
+    console.error('[Title Schedule Error]:', err);
+  }
+}
+
+// Polls OvenMediaEngine directly (mirrors what cf_purge_on_start.sh already
+// does for the Cloudflare purge-on-start job) so the backend knows stream
+// liveness without a new webhook or shared secret. Used here to reset the
+// title the moment a stream ends; fails closed on any error so a transient
+// OME API blip is never mistaken for the stream actually ending.
+const OME_API_URL = 'http://127.0.0.1:8081/v1/vhosts/default/apps/app/streams';
+
+async function pollStreamLive() {
+  try {
+    const token = process.env.OME_API_ACCESS_TOKEN;
+    if (!token) return; // not configured - skip silently, nothing to poll
+    const authHeader = 'Basic ' + Buffer.from(token, 'utf8').toString('base64');
+    const res = await fetch(OME_API_URL, {
+      headers: { Authorization: authHeader },
+      signal: AbortSignal.timeout(5000)
+    });
+    if (!res.ok) throw new Error(`OME API returned ${res.status}`);
+    const json = await res.json();
+    const live = Array.isArray(json.response) && json.response.length > 0;
+    const computedState = live ? 'live' : 'offline';
+
+    const row = db.prepare(`SELECT value FROM settings WHERE key = 'stream_live_state'`).get();
+    const persisted = row ? row.value : null;
+    if (computedState === persisted) return;
+
+    db.prepare(`
+      INSERT INTO settings (key, value) VALUES ('stream_live_state', ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    `).run(computedState);
+
+    if (persisted === 'live' && computedState === 'offline') {
+      applyTitle(TITLE_DEFAULT, 'stream ended');
+    }
+  } catch (err) {
+    // Fail closed: log and leave persisted state untouched so a network blip
+    // is never treated as the stream ending.
+    console.error('[Stream Live Poll Error]:', err.message || err);
+  }
+}
+
+sweepTitleSchedule();
+pollStreamLive();
+setInterval(sweepTitleSchedule, 60 * 1000);
+setInterval(pollStreamLive, 60 * 1000);
 
 // ---------- Helpers ----------
 const RESERVED_USERNAMES = ['admin', 'administrator', 'moderator', 'system', 'root', 'support'];
@@ -436,9 +557,9 @@ app.post('/api/stream-title', requireAuth, requireAdmin, (req, res) => {
 app.get('/api/stream-title', (req, res) => {
   try {
     const row = db.prepare(`SELECT value FROM settings WHERE key = 'stream_title'`).get();
-    return res.json({ title: row ? row.value : 'Live Stream' });
+    return res.json({ title: row ? row.value : TITLE_DEFAULT });
   } catch (err) {
-    return res.json({ title: 'Live Stream' });
+    return res.json({ title: TITLE_DEFAULT });
   }
 });
 
@@ -571,6 +692,9 @@ app.delete('/api/library/videos/:id', requireAuth, requireAdmin, (req, res) => {
 const POLL_MAX_OPTIONS = 10;
 const POLL_MAX_QUESTION_LEN = 300;
 const POLL_MAX_OPTION_LEN = 100;
+const POLL_MAX_ACTIVE = 5;
+const POLL_RUN_HOURS = 12;
+const POLL_RESULTS_HOURS = 8;
 
 function buildPollPayload(pollId, userId) {
   const poll = db.prepare('SELECT * FROM polls WHERE id = ?').get(pollId);
@@ -598,6 +722,8 @@ function buildPollPayload(pollId, userId) {
     status: poll.status,
     created_at: poll.created_at,
     closed_at: poll.closed_at,
+    closes_at: poll.closes_at,
+    expires_at: poll.expires_at,
     options,
     totalVotes,
     yourVote
@@ -650,15 +776,24 @@ function optionalUserId(req) {
   }
 }
 
-// GET /api/polls/active — the currently open poll, if any (public)
+// GET /api/polls/active — every poll still in the tab (running or showing
+// results), newest first. Up to POLL_MAX_ACTIVE at a time (public).
 app.get('/api/polls/active', (req, res) => {
   try {
-    const open = db.prepare(`SELECT id FROM polls WHERE status = 'open' ORDER BY id DESC LIMIT 1`).get();
-    if (!open) return res.json({ poll: null });
-    res.json({ poll: buildPollPayload(open.id, optionalUserId(req)) });
+    // status='open' always counts (a NULL closes_at on a pre-migration row
+    // just means "no deadline yet", not "not in the tab"). A closed poll
+    // only counts while still in its results window - a pre-migration
+    // closed poll has NULL expires_at and must NOT resurface here.
+    const rows = db.prepare(`
+      SELECT id FROM polls
+      WHERE status = 'open' OR (expires_at IS NOT NULL AND expires_at > datetime('now'))
+      ORDER BY id DESC
+    `).all();
+    const userId = optionalUserId(req);
+    res.json({ polls: rows.map(r => buildPollPayload(r.id, userId)) });
   } catch (err) {
-    console.error('Fetch active poll error:', err);
-    res.status(500).json({ error: 'Failed to fetch poll' });
+    console.error('Fetch active polls error:', err);
+    res.status(500).json({ error: 'Failed to fetch polls' });
   }
 });
 
@@ -680,9 +815,15 @@ app.post('/api/polls/:id/vote', requireAuth, (req, res) => {
     const optionId = Number((req.body || {}).option_id);
     if (!pollId || !optionId) return res.status(400).json({ error: 'Poll and option are required' });
 
-    const poll = db.prepare('SELECT * FROM polls WHERE id = ?').get(pollId);
+    const poll = db.prepare(`
+      SELECT *, (status = 'open' AND (closes_at IS NULL OR closes_at > datetime('now'))) AS is_votable
+      FROM polls WHERE id = ?
+    `).get(pollId);
     if (!poll) return res.status(404).json({ error: 'Poll not found' });
-    if (poll.status !== 'open') return res.status(409).json({ error: 'This poll is closed' });
+    // The is_votable check is belt-and-braces alongside sweepPolls(), which
+    // flips status at closes_at on a 60s tick - this closes the gap between
+    // expiry and the next sweep.
+    if (!poll.is_votable) return res.status(409).json({ error: 'This poll is closed' });
 
     const option = db.prepare('SELECT id FROM poll_options WHERE id = ? AND poll_id = ?').get(optionId, pollId);
     if (!option) return res.status(400).json({ error: 'That option does not belong to this poll' });
@@ -720,38 +861,41 @@ app.post('/api/polls', requireAuth, requireAdmin, (req, res) => {
       return res.status(400).json({ error: `Options must be ${POLL_MAX_OPTION_LEN} characters or fewer` });
     }
 
-    // Only one poll is open at a time - opening a new one closes the previous.
+    // Up to POLL_MAX_ACTIVE polls can be in the tab at once (running or
+    // showing results). Capacity is checked inside the same transaction as
+    // the insert to avoid a race between the check and the create. The
+    // lifecycle is now purely time-driven: 12h open, then 8h showing
+    // results, then deleted by sweepPolls() - there is no manual close.
+    let capacityError = false;
     const createPoll = db.transaction(() => {
-      db.prepare(`UPDATE polls SET status = 'closed', closed_at = CURRENT_TIMESTAMP WHERE status = 'open'`).run();
-      const info = db.prepare('INSERT INTO polls (question, created_by) VALUES (?, ?)').run(cleanQuestion, req.user.username);
+      const { count } = db.prepare(`
+        SELECT COUNT(*) AS count FROM polls
+        WHERE status = 'open' OR (expires_at IS NOT NULL AND expires_at > datetime('now'))
+      `).get();
+      if (count >= POLL_MAX_ACTIVE) {
+        capacityError = true;
+        return null;
+      }
+      const info = db.prepare(`
+        INSERT INTO polls (question, created_by, closes_at, expires_at)
+        VALUES (?, ?, datetime('now', '+${POLL_RUN_HOURS} hours'), datetime('now', '+${POLL_RUN_HOURS + POLL_RESULTS_HOURS} hours'))
+      `).run(cleanQuestion, req.user.username);
       const insertOption = db.prepare('INSERT INTO poll_options (poll_id, label, position) VALUES (?, ?, ?)');
       cleanOptions.forEach((label, i) => insertOption.run(info.lastInsertRowid, label, i));
       return info.lastInsertRowid;
     });
 
     const pollId = createPoll();
+    if (capacityError) {
+      return res.status(409).json({ error: `${POLL_MAX_ACTIVE} polls already in the tab — delete one to make room.` });
+    }
+
     const payload = buildPollPayload(pollId, null);
     io.emit('poll_started', payload);
     res.json({ success: true, poll: payload });
   } catch (err) {
     console.error('Create poll error:', err);
     res.status(500).json({ error: 'Failed to create poll' });
-  }
-});
-
-// POST /api/polls/:id/close — stop accepting votes (Admin only)
-app.post('/api/polls/:id/close', requireAuth, requireAdmin, (req, res) => {
-  try {
-    const pollId = Number(req.params.id);
-    const info = db.prepare(`UPDATE polls SET status = 'closed', closed_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'open'`).run(pollId);
-    if (info.changes === 0) return res.status(404).json({ error: 'No open poll with that id' });
-
-    const payload = buildPollPayload(pollId, null);
-    io.emit('poll_closed', payload);
-    res.json({ success: true, poll: payload });
-  } catch (err) {
-    console.error('Close poll error:', err);
-    res.status(500).json({ error: 'Failed to close poll' });
   }
 });
 
@@ -777,6 +921,47 @@ app.delete('/api/polls/:id', requireAuth, requireAdmin, (req, res) => {
     res.status(500).json({ error: 'Failed to delete poll' });
   }
 });
+
+// Every poll now runs on a fixed clock (open -> results -> gone) instead of
+// being closed by hand, so something has to advance that clock. Runs on the
+// same 60s cadence as the title sweeps; logs only when it actually acted,
+// matching the cleanupOldMessages() house pattern.
+function sweepPolls() {
+  try {
+    const toClose = db.prepare(`
+      SELECT id FROM polls WHERE status = 'open' AND closes_at <= datetime('now')
+    `).all();
+    if (toClose.length > 0) {
+      const closeStmt = db.prepare(`UPDATE polls SET status = 'closed', closed_at = CURRENT_TIMESTAMP WHERE id = ?`);
+      toClose.forEach(({ id }) => {
+        closeStmt.run(id);
+        io.emit('poll_closed', buildPollPayload(id, null));
+      });
+      console.log(`[Poll Sweep] Auto-closed ${toClose.length} poll(s).`);
+    }
+
+    const toDelete = db.prepare(`
+      SELECT id FROM polls WHERE expires_at IS NOT NULL AND expires_at <= datetime('now')
+    `).all();
+    if (toDelete.length > 0) {
+      const removePoll = db.transaction((id) => {
+        db.prepare('DELETE FROM poll_votes WHERE poll_id = ?').run(id);
+        db.prepare('DELETE FROM poll_options WHERE poll_id = ?').run(id);
+        db.prepare('DELETE FROM polls WHERE id = ?').run(id);
+      });
+      toDelete.forEach(({ id }) => {
+        removePoll(id);
+        io.emit('poll_closed', { id, deleted: true });
+      });
+      console.log(`[Poll Sweep] Deleted ${toDelete.length} expired poll(s).`);
+    }
+  } catch (err) {
+    console.error('[Poll Sweep Error]:', err);
+  }
+}
+
+sweepPolls();
+setInterval(sweepPolls, 60 * 1000);
 
 // ---------- Clips ----------
 // Cuts an MP4 straight out of the OME LLHLS DVR window with `-c copy` (no
