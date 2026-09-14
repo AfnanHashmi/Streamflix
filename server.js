@@ -155,6 +155,18 @@ try {
 // of the old "one poll at a time" model. CREATE TABLE IF NOT EXISTS won't add
 // columns to an already-existing table, so these are guarded the same way as
 // the users.role migration above.
+// Sign in with X (beta): a proven X identity locks the username and drives
+// chat styling. x_id IS NOT NULL is itself the "locked" flag - no separate
+// column needed, since no route anywhere lets a user edit their username.
+// SQLite can't add a UNIQUE column via ALTER, so uniqueness comes from a
+// partial index instead (only enforced where x_id is actually set).
+try { db.exec(`ALTER TABLE users ADD COLUMN x_id TEXT`); } catch (e) {}
+try { db.exec(`ALTER TABLE users ADD COLUMN x_handle TEXT`); } catch (e) {}
+try { db.exec(`ALTER TABLE users ADD COLUMN x_name TEXT`); } catch (e) {}
+try { db.exec(`ALTER TABLE users ADD COLUMN x_verified INTEGER NOT NULL DEFAULT 0`); } catch (e) {}
+try { db.exec(`ALTER TABLE users ADD COLUMN x_linked_at TEXT`); } catch (e) {}
+db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_x_id ON users(x_id) WHERE x_id IS NOT NULL`);
+
 try {
   db.exec(`ALTER TABLE polls ADD COLUMN closes_at DATETIME`);
 } catch (e) {}
@@ -320,7 +332,10 @@ function signToken(user) {
       username: user.username,
       email: user.email,
       role: user.role || (isAdmin ? 'admin' : 'user'),
-      isAdmin
+      isAdmin,
+      isXUser: !!user.x_id,
+      xHandle: user.x_handle || null,
+      xVerified: !!user.x_verified
     },
     JWT_SECRET,
     { expiresIn: '30d' }
@@ -387,13 +402,19 @@ io.on('connection', (socket) => {
 
   const senderUsername = socket.user?.username || 'User';
   const isSenderAdmin = !!(socket.user?.role === 'admin' || socket.user?.isAdmin);
+  const isSenderX = !!socket.user?.isXUser;
+  const senderXHandle = socket.user?.xHandle || null;
+  const isSenderXVerified = !!socket.user?.xVerified;
 
   // Send the past 24 hours of messages with admin flags to the newly connected user
   try {
     const history = db.prepare(`
-      SELECT cm.id, cm.username, cm.message, 
+      SELECT cm.id, cm.username, cm.message,
              strftime('%H:%M', cm.created_at, 'localtime') as timestamp,
-             CASE WHEN u.role = 'admin' OR u.is_admin = 1 THEN 1 ELSE 0 END as isAdmin
+             CASE WHEN u.role = 'admin' OR u.is_admin = 1 THEN 1 ELSE 0 END as isAdmin,
+             CASE WHEN u.x_id IS NOT NULL THEN 1 ELSE 0 END as isXUser,
+             u.x_handle as xHandle,
+             CASE WHEN u.x_verified = 1 THEN 1 ELSE 0 END as xVerified
       FROM chat_messages cm
       LEFT JOIN users u ON LOWER(cm.username) = LOWER(u.username)
       WHERE cm.created_at >= datetime('now', '-24 hours')
@@ -425,7 +446,10 @@ io.on('connection', (socket) => {
         username: senderUsername,
         message: cleanMsg,
         timestamp: timestamp,
-        isAdmin: isSenderAdmin
+        isAdmin: isSenderAdmin,
+        isXUser: isSenderX,
+        xHandle: senderXHandle,
+        xVerified: isSenderXVerified
       });
     } catch (err) {
       console.error('Failed to save chat message:', err);
@@ -523,7 +547,218 @@ app.post('/api/logout', (req, res) => {
 });
 
 app.get('/api/me', requireAuth, (req, res) => {
-  res.json({ username: req.user.username, email: req.user.email, role: req.user.role || (req.user.isAdmin ? 'admin' : 'user'), isAdmin: !!req.user.isAdmin });
+  res.json({
+    username: req.user.username,
+    email: req.user.email,
+    role: req.user.role || (req.user.isAdmin ? 'admin' : 'user'),
+    isAdmin: !!req.user.isAdmin,
+    isXUser: !!req.user.isXUser,
+    xHandle: req.user.xHandle || null,
+    xVerified: !!req.user.xVerified
+  });
+});
+
+// ---------- Sign in with X (beta) ----------
+// Additive to email/password signup, never a replacement. A proven X
+// identity locks the username to the real handle and drives a distinct chat
+// look - this exists because most of the audience comes from X and people
+// were squatting well-known handles in chat to impersonate them. Costs one
+// billed X API read ($0.010) per NEW account, at signup only; returning
+// users never touch the X API again (see resolveAccount below).
+const X_AUTHORIZE_URL = 'https://x.com/i/oauth2/authorize';
+const X_TOKEN_URL = 'https://api.x.com/2/oauth2/token';
+const X_ME_URL = 'https://api.x.com/2/users/me';
+
+function base64url(buf) {
+  return buf.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+// The site sits behind an invite-link gate (requireAccessSession, only
+// applied to '/', '/index.html', '/live', '/live/index.html' - see the top
+// of this file). A freshly X-authed user has no access_session cookie yet,
+// so without this they'd be redirected straight into no-access.html despite
+// having just proven who they are. Mirrors the cookie accessTokens.js's
+// /access route sets (registerAccessRoute), but X sign-in is an independent
+// door into the site, so it mints its own 24h session rather than depending
+// on the shared rotating invite token.
+function mintAccessSession(res) {
+  const sessionJwt = jwt.sign({ type: 'access_session' }, JWT_SECRET, { expiresIn: '24h' });
+  res.cookie('access_session', sessionJwt, {
+    httpOnly: true,
+    secure: IS_PROD,
+    path: '/',
+    sameSite: 'lax',
+    maxAge: 24 * 60 * 60 * 1000
+  });
+}
+
+app.get('/api/auth/x/start', (req, res) => {
+  if (process.env.X_SIGNUP_ENABLED !== 'true') return res.status(404).send('Not found');
+  if (!process.env.X_CLIENT_ID || !process.env.X_REDIRECT_URI) {
+    console.error('[X Signup] X_CLIENT_ID/X_REDIRECT_URI not configured');
+    return res.status(503).send('X sign-in is not configured');
+  }
+
+  const state = base64url(crypto.randomBytes(24));
+  const codeVerifier = base64url(crypto.randomBytes(32));
+  const codeChallenge = base64url(crypto.createHash('sha256').update(codeVerifier).digest());
+
+  // Ephemeral OAuth state, kept the same way access_session is - a signed,
+  // short-expiry JWT in a cookie - rather than a new DB table + sweeper.
+  const oauthJwt = jwt.sign({ type: 'x_oauth', state, codeVerifier }, JWT_SECRET, { expiresIn: '10m' });
+  res.cookie('x_oauth', oauthJwt, {
+    httpOnly: true,
+    secure: IS_PROD,
+    path: '/',
+    sameSite: 'lax',
+    maxAge: 10 * 60 * 1000
+  });
+
+  const params = new URLSearchParams({
+    response_type: 'code',
+    client_id: process.env.X_CLIENT_ID,
+    redirect_uri: process.env.X_REDIRECT_URI,
+    scope: 'tweet.read users.read',
+    state,
+    code_challenge: codeChallenge,
+    code_challenge_method: 'S256'
+  });
+  res.redirect(`${X_AUTHORIZE_URL}?${params.toString()}`);
+});
+
+app.get('/api/auth/x/callback', async (req, res) => {
+  const failRedirect = (reason) => {
+    console.error('[X Signup] Callback failed:', reason);
+    res.clearCookie('x_oauth');
+    return res.redirect('/login.html?x_error=1');
+  };
+
+  try {
+    if (process.env.X_SIGNUP_ENABLED !== 'true') return res.status(404).send('Not found');
+
+    const { code, state } = req.query;
+    const oauthCookie = req.cookies.x_oauth;
+    if (!code || !state || !oauthCookie) return failRedirect('missing code/state/cookie');
+
+    let oauthPayload;
+    try {
+      oauthPayload = jwt.verify(oauthCookie, JWT_SECRET);
+    } catch {
+      return failRedirect('invalid or expired x_oauth cookie');
+    }
+    if (oauthPayload.type !== 'x_oauth' || oauthPayload.state !== state) {
+      return failRedirect('state mismatch');
+    }
+    res.clearCookie('x_oauth');
+
+    // ---- Token exchange - confidential client, HTTP Basic id:secret ----
+    const basicAuth = Buffer.from(`${process.env.X_CLIENT_ID}:${process.env.X_CLIENT_SECRET}`).toString('base64');
+    const tokenRes = await fetch(X_TOKEN_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Authorization': `Basic ${basicAuth}`
+      },
+      body: new URLSearchParams({
+        code: String(code),
+        grant_type: 'authorization_code',
+        redirect_uri: process.env.X_REDIRECT_URI,
+        code_verifier: oauthPayload.codeVerifier
+      }),
+      signal: AbortSignal.timeout(5000)
+    });
+    if (!tokenRes.ok) return failRedirect(`token exchange ${tokenRes.status}`);
+    const tokenJson = await tokenRes.json();
+    const xAccessToken = tokenJson.access_token;
+    if (!xAccessToken) return failRedirect('no access_token in token response');
+
+    // ---- The one billed call ($0.010), made once and never repeated for
+    // this user again - a returning login re-reads our own DB instead. ----
+    const meRes = await fetch(
+      `${X_ME_URL}?user.fields=name,username,verified,verified_type,profile_image_url`,
+      { headers: { Authorization: `Bearer ${xAccessToken}` }, signal: AbortSignal.timeout(5000) }
+    );
+    if (!meRes.ok) return failRedirect(`users/me ${meRes.status}`);
+    const meJson = await meRes.json();
+    const xUser = meJson.data;
+    if (!xUser || !xUser.id || !xUser.username) return failRedirect('malformed users/me response');
+    // xAccessToken is discarded here - nothing else in this route touches X again.
+
+    const xId = String(xUser.id);
+    const xHandle = xUser.username;
+    const xName = xUser.name || xHandle;
+    const xVerified = xUser.verified === true ? 1 : 0;
+
+    const resolveAccount = db.transaction(() => {
+      // 1. Returning X user - refresh handle/name only, never re-reads
+      // verified status and never counts against the beta cap.
+      const existing = db.prepare('SELECT * FROM users WHERE x_id = ?').get(xId);
+      if (existing) {
+        if (existing.x_handle !== xHandle || existing.x_name !== xName) {
+          db.prepare('UPDATE users SET x_handle = ?, x_name = ? WHERE id = ?').run(xHandle, xName, existing.id);
+        }
+        return { user: existing, outcome: 'login' };
+      }
+
+      // 2. Beta cap - counts distinct X accounts, not logins.
+      const max = parseInt(process.env.X_SIGNUP_MAX || '0', 10);
+      if (max > 0) {
+        const { count } = db.prepare('SELECT COUNT(*) as count FROM users WHERE x_id IS NOT NULL').get();
+        if (count >= max) return { outcome: 'full' };
+      }
+
+      // 3. Name clash. Admins and already-X-linked accounts are never
+      // displaced. Anyone else loses the handle to its proven owner - this
+      // is the actual anti-impersonation mechanism the feature exists for.
+      const clash = db.prepare('SELECT * FROM users WHERE LOWER(username) = LOWER(?)').get(xHandle);
+      if (clash) {
+        const clashIsAdmin = clash.role === 'admin' || !!clash.is_admin;
+        if (clashIsAdmin) return { outcome: 'admin_clash' };
+        if (clash.x_id) return { outcome: 'x_clash' };
+
+        // chat_history re-derives isAdmin/isXUser via a live join on
+        // username (see the socket connection handler above) - leaving the
+        // squatter's old messages in place would make them immediately
+        // render WITH the new X user's badge the moment the handle
+        // transfers. Deleting them is what makes the displacement correct,
+        // not optional cleanup.
+        db.prepare('DELETE FROM chat_messages WHERE LOWER(username) = LOWER(?)').run(clash.username);
+        db.prepare('DELETE FROM poll_votes WHERE user_id = ?').run(clash.id);
+        db.prepare('DELETE FROM users WHERE id = ?').run(clash.id);
+        console.log(`[X Signup] Displaced local user "${clash.username}" (id ${clash.id}) for verified X handle @${xHandle}`);
+      }
+
+      // 4. Create the account. password_hash/email get unusable
+      // placeholders - the columns are NOT NULL/UNIQUE, but nobody knows
+      // the random password and '.local' can never be a real deliverable
+      // address, so /api/login can never authenticate this row.
+      const placeholderHash = bcrypt.hashSync(crypto.randomBytes(32).toString('hex'), 12);
+      const placeholderEmail = `x_${xId}@x.local`;
+      const info = db.prepare(`
+        INSERT INTO users (username, email, password_hash, role, is_admin, x_id, x_handle, x_name, x_verified, x_linked_at)
+        VALUES (?, ?, ?, 'user', 0, ?, ?, ?, ?, datetime('now'))
+      `).run(xHandle, placeholderEmail, placeholderHash, xId, xHandle, xName, xVerified);
+
+      const created = db.prepare('SELECT * FROM users WHERE id = ?').get(info.lastInsertRowid);
+      return { user: created, outcome: 'signup' };
+    });
+
+    const result = resolveAccount();
+
+    if (result.outcome === 'full') return res.redirect('/login.html?x_error=full');
+    if (result.outcome === 'admin_clash' || result.outcome === 'x_clash') {
+      return res.redirect('/login.html?x_error=taken');
+    }
+
+    const token = signToken(result.user);
+    setAuthCookie(res, token);
+    mintAccessSession(res);
+
+    console.log(`[X Signup] ${result.outcome === 'signup' ? 'New' : 'Returning'} X user @${xHandle} (verified=${!!xVerified}) logged in.`);
+    return res.redirect('/live');
+  } catch (err) {
+    return failRedirect(err.message || err);
+  }
 });
 
 // ---------- Stream title ----------
