@@ -672,8 +672,14 @@ app.get('/api/auth/x/callback', async (req, res) => {
     const xAccessToken = tokenJson.access_token;
     if (!xAccessToken) return failRedirect('no access_token in token response');
 
-    // ---- The one billed call ($0.010), made once and never repeated for
-    // this user again - a returning login re-reads our own DB instead. ----
+    // ---- The billed call ($0.010). Runs on EVERY completed OAuth flow, new
+    // signup or returning login alike - X's callback only returns a `code`,
+    // never the user's identity, so there's no way to know "is this a
+    // returning user" without calling users/me first. The cost is bounded
+    // by how often someone re-runs this flow, not by page views: a
+    // completed login gets the normal 30-day streamflix_session cookie, so
+    // the same browser won't hit this route again until that expires or
+    // they explicitly log out. ----
     const meRes = await fetch(
       `${X_ME_URL}?user.fields=name,username,verified,verified_type,profile_image_url`,
       { headers: { Authorization: `Bearer ${xAccessToken}` }, signal: AbortSignal.timeout(5000) }
