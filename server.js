@@ -155,8 +155,8 @@ try {
 // of the old "one poll at a time" model. CREATE TABLE IF NOT EXISTS won't add
 // columns to an already-existing table, so these are guarded the same way as
 // the users.role migration above.
-// Sign in with X (beta): a proven X identity locks the username and drives
-// chat styling. x_id IS NOT NULL is itself the "locked" flag - no separate
+// Sign in with X: a proven X identity locks the username and drives chat
+// styling. x_id IS NOT NULL is itself the "locked" flag - no separate
 // column needed, since no route anywhere lets a user edit their username.
 // SQLite can't add a UNIQUE column via ALTER, so uniqueness comes from a
 // partial index instead (only enforced where x_id is actually set).
@@ -165,6 +165,7 @@ try { db.exec(`ALTER TABLE users ADD COLUMN x_handle TEXT`); } catch (e) {}
 try { db.exec(`ALTER TABLE users ADD COLUMN x_name TEXT`); } catch (e) {}
 try { db.exec(`ALTER TABLE users ADD COLUMN x_verified INTEGER NOT NULL DEFAULT 0`); } catch (e) {}
 try { db.exec(`ALTER TABLE users ADD COLUMN x_linked_at TEXT`); } catch (e) {}
+try { db.exec(`ALTER TABLE users ADD COLUMN x_pfp_url TEXT`); } catch (e) {}
 db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_x_id ON users(x_id) WHERE x_id IS NOT NULL`);
 
 try {
@@ -335,7 +336,8 @@ function signToken(user) {
       isAdmin,
       isXUser: !!user.x_id,
       xHandle: user.x_handle || null,
-      xVerified: !!user.x_verified
+      xVerified: !!user.x_verified,
+      xPfpUrl: user.x_pfp_url || null
     },
     JWT_SECRET,
     { expiresIn: '30d' }
@@ -405,6 +407,7 @@ io.on('connection', (socket) => {
   const isSenderX = !!socket.user?.isXUser;
   const senderXHandle = socket.user?.xHandle || null;
   const isSenderXVerified = !!socket.user?.xVerified;
+  const senderXPfpUrl = socket.user?.xPfpUrl || null;
 
   // Send the past 24 hours of messages with admin flags to the newly connected user
   try {
@@ -414,7 +417,8 @@ io.on('connection', (socket) => {
              CASE WHEN u.role = 'admin' OR u.is_admin = 1 THEN 1 ELSE 0 END as isAdmin,
              CASE WHEN u.x_id IS NOT NULL THEN 1 ELSE 0 END as isXUser,
              u.x_handle as xHandle,
-             CASE WHEN u.x_verified = 1 THEN 1 ELSE 0 END as xVerified
+             CASE WHEN u.x_verified = 1 THEN 1 ELSE 0 END as xVerified,
+             u.x_pfp_url as xPfpUrl
       FROM chat_messages cm
       LEFT JOIN users u ON LOWER(cm.username) = LOWER(u.username)
       WHERE cm.created_at >= datetime('now', '-24 hours')
@@ -449,7 +453,8 @@ io.on('connection', (socket) => {
         isAdmin: isSenderAdmin,
         isXUser: isSenderX,
         xHandle: senderXHandle,
-        xVerified: isSenderXVerified
+        xVerified: isSenderXVerified,
+        xPfpUrl: senderXPfpUrl
       });
     } catch (err) {
       console.error('Failed to save chat message:', err);
@@ -554,17 +559,19 @@ app.get('/api/me', requireAuth, (req, res) => {
     isAdmin: !!req.user.isAdmin,
     isXUser: !!req.user.isXUser,
     xHandle: req.user.xHandle || null,
-    xVerified: !!req.user.xVerified
+    xVerified: !!req.user.xVerified,
+    xPfpUrl: req.user.xPfpUrl || null
   });
 });
 
-// ---------- Sign in with X (beta) ----------
+// ---------- Sign in with X ----------
 // Additive to email/password signup, never a replacement. A proven X
 // identity locks the username to the real handle and drives a distinct chat
 // look - this exists because most of the audience comes from X and people
 // were squatting well-known handles in chat to impersonate them. Costs one
-// billed X API read ($0.010) per NEW account, at signup only; returning
-// users never touch the X API again (see resolveAccount below).
+// billed X API read ($0.010) per COMPLETED OAUTH FLOW - new signup or
+// returning login alike, since X's callback never tells us who's
+// authorizing until we call users/me (see the comment at that call below).
 const X_AUTHORIZE_URL = 'https://x.com/i/oauth2/authorize';
 const X_TOKEN_URL = 'https://api.x.com/2/oauth2/token';
 const X_ME_URL = 'https://api.x.com/2/users/me';
@@ -573,14 +580,25 @@ function base64url(buf) {
   return buf.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
+// X serves profile_image_url at 48x48 (the "_normal" size) - the chat
+// avatar renders at 28px desktop / 24px mobile, so on a 2x display "_normal"
+// is visibly soft. "_bigger" is 73x73 and still only a few KB. The host
+// check matters beyond validation: this string lands in an <img src> on
+// every viewer's page, so only a pbs.twimg.com URL is ever accepted.
+function normalizeXPfp(url) {
+  if (typeof url !== 'string' || !url.startsWith('https://pbs.twimg.com/')) return null;
+  return url.replace('_normal.', '_bigger.');
+}
+
 // The site sits behind an invite-link gate (requireAccessSession, only
 // applied to '/', '/index.html', '/live', '/live/index.html' - see the top
 // of this file). A freshly X-authed user has no access_session cookie yet,
 // so without this they'd be redirected straight into no-access.html despite
 // having just proven who they are. Mirrors the cookie accessTokens.js's
-// /access route sets (registerAccessRoute), but X sign-in is an independent
-// door into the site, so it mints its own 24h session rather than depending
-// on the shared rotating invite token.
+// /access route sets (registerAccessRoute), but X sign-in is an independent,
+// permanent door into the site (nothing gates this route anymore - see
+// /api/auth/x/callback below), so it mints its own 24h session rather than
+// depending on the shared rotating invite token.
 function mintAccessSession(res) {
   const sessionJwt = jwt.sign({ type: 'access_session' }, JWT_SECRET, { expiresIn: '24h' });
   res.cookie('access_session', sessionJwt, {
@@ -593,7 +611,6 @@ function mintAccessSession(res) {
 }
 
 app.get('/api/auth/x/start', (req, res) => {
-  if (process.env.X_SIGNUP_ENABLED !== 'true') return res.status(404).send('Not found');
   if (!process.env.X_CLIENT_ID || !process.env.X_REDIRECT_URI) {
     console.error('[X Signup] X_CLIENT_ID/X_REDIRECT_URI not configured');
     return res.status(503).send('X sign-in is not configured');
@@ -634,8 +651,6 @@ app.get('/api/auth/x/callback', async (req, res) => {
   };
 
   try {
-    if (process.env.X_SIGNUP_ENABLED !== 'true') return res.status(404).send('Not found');
-
     const { code, state } = req.query;
     const oauthCookie = req.cookies.x_oauth;
     if (!code || !state || !oauthCookie) return failRedirect('missing code/state/cookie');
@@ -694,26 +709,23 @@ app.get('/api/auth/x/callback', async (req, res) => {
     const xHandle = xUser.username;
     const xName = xUser.name || xHandle;
     const xVerified = xUser.verified === true ? 1 : 0;
+    const xPfpUrl = normalizeXPfp(xUser.profile_image_url);
 
     const resolveAccount = db.transaction(() => {
-      // 1. Returning X user - refresh handle/name only, never re-reads
-      // verified status and never counts against the beta cap.
+      // 1. Returning X user - refresh everything X gave us on every login
+      // (handle, name, verified, picture). This is free: users/me already
+      // returned all of it for the billed call above, so there's no reason
+      // to leave a lapsed Premium badge or a stale picture stuck on the
+      // account. Never counts against account creation (no cap exists).
       const existing = db.prepare('SELECT * FROM users WHERE x_id = ?').get(xId);
       if (existing) {
-        if (existing.x_handle !== xHandle || existing.x_name !== xName) {
-          db.prepare('UPDATE users SET x_handle = ?, x_name = ? WHERE id = ?').run(xHandle, xName, existing.id);
-        }
-        return { user: existing, outcome: 'login' };
+        db.prepare('UPDATE users SET x_handle = ?, x_name = ?, x_verified = ?, x_pfp_url = ? WHERE id = ?')
+          .run(xHandle, xName, xVerified, xPfpUrl, existing.id);
+        const refreshed = db.prepare('SELECT * FROM users WHERE id = ?').get(existing.id);
+        return { user: refreshed, outcome: 'login' };
       }
 
-      // 2. Beta cap - counts distinct X accounts, not logins.
-      const max = parseInt(process.env.X_SIGNUP_MAX || '0', 10);
-      if (max > 0) {
-        const { count } = db.prepare('SELECT COUNT(*) as count FROM users WHERE x_id IS NOT NULL').get();
-        if (count >= max) return { outcome: 'full' };
-      }
-
-      // 3. Name clash. Admins and already-X-linked accounts are never
+      // 2. Name clash. Admins and already-X-linked accounts are never
       // displaced. Anyone else loses the handle to its proven owner - this
       // is the actual anti-impersonation mechanism the feature exists for.
       const clash = db.prepare('SELECT * FROM users WHERE LOWER(username) = LOWER(?)').get(xHandle);
@@ -734,16 +746,16 @@ app.get('/api/auth/x/callback', async (req, res) => {
         console.log(`[X Signup] Displaced local user "${clash.username}" (id ${clash.id}) for verified X handle @${xHandle}`);
       }
 
-      // 4. Create the account. password_hash/email get unusable
+      // 3. Create the account. password_hash/email get unusable
       // placeholders - the columns are NOT NULL/UNIQUE, but nobody knows
       // the random password and '.local' can never be a real deliverable
       // address, so /api/login can never authenticate this row.
       const placeholderHash = bcrypt.hashSync(crypto.randomBytes(32).toString('hex'), 12);
       const placeholderEmail = `x_${xId}@x.local`;
       const info = db.prepare(`
-        INSERT INTO users (username, email, password_hash, role, is_admin, x_id, x_handle, x_name, x_verified, x_linked_at)
-        VALUES (?, ?, ?, 'user', 0, ?, ?, ?, ?, datetime('now'))
-      `).run(xHandle, placeholderEmail, placeholderHash, xId, xHandle, xName, xVerified);
+        INSERT INTO users (username, email, password_hash, role, is_admin, x_id, x_handle, x_name, x_verified, x_pfp_url, x_linked_at)
+        VALUES (?, ?, ?, 'user', 0, ?, ?, ?, ?, ?, datetime('now'))
+      `).run(xHandle, placeholderEmail, placeholderHash, xId, xHandle, xName, xVerified, xPfpUrl);
 
       const created = db.prepare('SELECT * FROM users WHERE id = ?').get(info.lastInsertRowid);
       return { user: created, outcome: 'signup' };
@@ -751,7 +763,6 @@ app.get('/api/auth/x/callback', async (req, res) => {
 
     const result = resolveAccount();
 
-    if (result.outcome === 'full') return res.redirect('/login.html?x_error=full');
     if (result.outcome === 'admin_clash' || result.outcome === 'x_clash') {
       return res.redirect('/login.html?x_error=taken');
     }
