@@ -114,11 +114,19 @@ function verifyAccessCookie(req) {
 // see initAccessTokens below) passes, independent of the rotating link.
 // streamflix_session tokens carry no `type` field (see signToken in
 // server.js), unlike access_session - just needs to verify and decode.
+// Same gap that requireAuth (server.js) and the socket.io auth middleware
+// had until this session's account-existence fix: jwt.verify alone accepts
+// a token for an account that's since been deleted/banned. Without this
+// check here too, /live itself (and therefore the whole page, including
+// whatever signed stream URLs it goes on to fetch) stayed reachable for a
+// banned user's still-valid 30-day cookie.
 function verifyUserSession(req) {
   const token = req.cookies && req.cookies.streamflix_session;
   if (!token) return null;
   try {
-    return _jwt.verify(token, _jwtSecret);
+    const payload = _jwt.verify(token, _jwtSecret);
+    if (!_db.prepare('SELECT id FROM users WHERE id = ?').get(payload.id)) return null;
+    return payload;
   } catch {
     return null;
   }
