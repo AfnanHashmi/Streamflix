@@ -506,19 +506,29 @@ function broadcastViewerCount() {
   io.emit('viewer_count', distinctCount);
 }
 
+// Crude UA sniff, only for the admin presence view ("who's on desktop") -
+// never used for anything access-related. Tablets count as mobile since
+// that's what they are for a "desktop only" idle-limiter-style question.
+function classifyDevice(userAgent) {
+  if (!userAgent) return 'unknown';
+  return /Mobi|Android|iPhone|iPad|iPod|Tablet/i.test(userAgent) ? 'mobile' : 'desktop';
+}
+
 io.on('connection', (socket) => {
   const presenceUserId = socket.user?.id || null;
   const anonViewerId = !presenceUserId && typeof socket.handshake.auth?.viewerId === 'string'
     ? socket.handshake.auth.viewerId.slice(0, 64)
     : null;
+  const deviceType = classifyDevice(socket.handshake.headers['user-agent']);
 
   if (presenceUserId) {
     let entry = presenceMap.get(presenceUserId);
     if (!entry) {
-      entry = { username: socket.user.username, socketIds: new Set(), connectedAt: Date.now() };
+      entry = { username: socket.user.username, socketIds: new Set(), connectedAt: Date.now(), devices: new Map() };
       presenceMap.set(presenceUserId, entry);
     }
     entry.socketIds.add(socket.id);
+    entry.devices.set(socket.id, deviceType);
     try {
       db.prepare(`UPDATE users SET last_seen = datetime('now') WHERE id = ?`).run(presenceUserId);
     } catch (err) {
@@ -539,6 +549,7 @@ io.on('connection', (socket) => {
       const entry = presenceMap.get(presenceUserId);
       if (entry) {
         entry.socketIds.delete(socket.id);
+        entry.devices.delete(socket.id);
         if (entry.socketIds.size === 0) presenceMap.delete(presenceUserId);
       }
     } else if (anonViewerId) {
@@ -701,6 +712,7 @@ app.get('/api/admin/presence', requireAuth, requireAdmin, (req, res) => {
       username: user.username,
       connected: !!live,
       socketCount: live ? live.socketIds.size : 0,
+      devices: live ? [...new Set(live.devices.values())] : [],
       connectedSince: live ? new Date(live.connectedAt).toISOString() : null,
       lastSeen: user.last_seen || null
     });
@@ -712,6 +724,7 @@ app.get('/api/admin/presence', requireAuth, requireAdmin, (req, res) => {
       userId,
       username: entry.username,
       socketCount: entry.socketIds.size,
+      devices: [...new Set(entry.devices.values())],
       connectedSince: new Date(entry.connectedAt).toISOString()
     });
   }
