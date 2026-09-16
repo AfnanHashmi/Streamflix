@@ -14,6 +14,7 @@ const { pipeline } = require('stream');
 const path = require('path');
 const crypto = require('crypto');
 const { initAccessTokens, requireAccessSession, gateStream } = require('./accessTokens');
+const rateLimit = require('express-rate-limit');
 
 const app = express();
 const server = http.createServer(app);
@@ -39,6 +40,33 @@ app.use(cors({
   origin: process.env.SITE_ORIGIN || 'https://biggboss24hrs.com',
   credentials: true
 }));
+
+// ---------- Rate limiting ----------
+// /api/login and /admin/current-link were both unlimited - the former is
+// brute-forceable against 349+ real accounts, the latter leaks the live
+// invite link on a single successful guess. nginx now forwards the real
+// visitor IP via X-Real-IP (CF-Connecting-IP) rather than Cloudflare's own
+// edge IP - every request reaching nginx on 443 already passed through
+// Cloudflare (ufw restricts 443 to Cloudflare's ranges only), so this
+// header is always authoritative here, unlike trusting X-Forwarded-For's
+// chain math. Falls back to req.ip only if the header is ever missing
+// (e.g. a direct loopback request during local testing).
+function realIp(req) {
+  return req.headers['x-real-ip'] || req.ip;
+}
+
+function makeLimiter(windowMs, max, message) {
+  return rateLimit({
+    windowMs,
+    max,
+    keyGenerator: realIp,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: message }
+  });
+}
+
+const loginLimiter = makeLimiter(15 * 60 * 1000, 10, 'Too many login attempts. Please try again in 15 minutes.');
 
 // ---------- Access-gated HTML routes (must come BEFORE express.static) ----------
 // These intercept requests for the homepage and live page and enforce the
@@ -189,6 +217,11 @@ try { db.exec(`ALTER TABLE users ADD COLUMN google_linked_at TEXT`); } catch (e)
 // is the fix for the bug where linking silently adopted an admin's photo.
 try { db.exec(`ALTER TABLE users ADD COLUMN google_native INTEGER NOT NULL DEFAULT 0`); } catch (e) {}
 db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_google_id ON users(google_id) WHERE google_id IS NOT NULL`);
+
+// One cheap write per socket connect (not per message, not polled) - this
+// is what makes "is user X watching" answerable at all, which previously
+// required grepping chat/poll history for indirect evidence.
+try { db.exec(`ALTER TABLE users ADD COLUMN last_seen DATETIME`); } catch (e) {}
 
 try {
   db.exec(`ALTER TABLE polls ADD COLUMN closes_at DATETIME`);
@@ -417,13 +450,46 @@ io.use((socket, next) => {
 // 3. Socket.io Connection & History Logic
 let activeViewers = 0;
 
+// Lightweight live presence: an in-memory Map, updated only on
+// connect/disconnect (not polled, not per-message) - this is what makes
+// "is user X watching right now" answerable at all, rather than the
+// indirect chat/poll-history guessing this previously required. One cheap
+// DB write per connect keeps a last_seen timestamp for users who aren't
+// currently connected. Deliberately NOT persisted beyond that single
+// column - a full connection history log was explicitly out of scope
+// ("if not machine heavy").
+const presenceMap = new Map(); // userId -> { username, socketIds: Set, connectedAt }
+
 io.on('connection', (socket) => {
   activeViewers++;
   io.emit('viewer_count', activeViewers);
 
+  const presenceUserId = socket.user?.id || null;
+  if (presenceUserId) {
+    let entry = presenceMap.get(presenceUserId);
+    if (!entry) {
+      entry = { username: socket.user.username, socketIds: new Set(), connectedAt: Date.now() };
+      presenceMap.set(presenceUserId, entry);
+    }
+    entry.socketIds.add(socket.id);
+    try {
+      db.prepare(`UPDATE users SET last_seen = datetime('now') WHERE id = ?`).run(presenceUserId);
+    } catch (err) {
+      console.error('[Presence] Failed to update last_seen:', err);
+    }
+  }
+
   socket.on('disconnect', () => {
     activeViewers = Math.max(0, activeViewers - 1);
     io.emit('viewer_count', activeViewers);
+
+    if (presenceUserId) {
+      const entry = presenceMap.get(presenceUserId);
+      if (entry) {
+        entry.socketIds.delete(socket.id);
+        if (entry.socketIds.size === 0) presenceMap.delete(presenceUserId);
+      }
+    }
   });
 
   const senderUsername = socket.user?.username || 'User';
@@ -494,55 +560,18 @@ io.on('connection', (socket) => {
 });
 
 // ---------- Auth routes ----------
-app.post('/api/signup', async (req, res) => {
-  try {
-    const { username, email, password } = req.body || {};
-    if (!username || !username.trim() || !email || !password || password.length < 8) {
-      return res.status(400).json({ error: 'Username, valid email, and password of at least 8 characters are required' });
-    }
-
-    const cleanUsername = username.trim();
-    const cleanEmail = email.toLowerCase().trim();
-
-    // 1. Block Reserved Usernames (403 Error)
-    if (RESERVED_USERNAMES.includes(cleanUsername.toLowerCase())) {
-      return res.status(403).json({ error: 'This username is reserved and cannot be registered.' });
-    }
-
-    // 2. Check if Username is taken (Case-Insensitive 400 Error)
-    const existingUsername = db.prepare('SELECT id FROM users WHERE LOWER(username) = LOWER(?)').get(cleanUsername);
-    if (existingUsername) {
-      return res.status(400).json({ error: 'Username is already taken. Please choose another.' });
-    }
-
-    // 3. Check if Email is taken (409 Error)
-    const existingEmail = db.prepare('SELECT id FROM users WHERE LOWER(email) = LOWER(?)').get(cleanEmail);
-    if (existingEmail) {
-      return res.status(409).json({ error: 'An account with this email already exists' });
-    }
-
-    // 4. Role Assignment — all new accounts are standard users
-    const role = 'user';
-    const isAdmin = 0;
-
-    const hash = await bcrypt.hash(password, 12);
-
-    const info = db.prepare(
-      'INSERT INTO users (username, email, password_hash, role, is_admin) VALUES (?, ?, ?, ?, ?)'
-    ).run(cleanUsername, cleanEmail, hash, role, isAdmin);
-
-    const user = { id: info.lastInsertRowid, username: cleanUsername, email: cleanEmail, role, is_admin: isAdmin };
-    const token = signToken(user);
-    setAuthCookie(res, token);
-    res.json({ token, username: user.username, email: user.email, role: user.role, isAdmin: !!user.is_admin });
-  } catch (err) {
-    console.error('Signup Error:', err);
-    res.status(500).json({ error: 'Server error during signup' });
-  }
+// Password signup is retired - X and Google are the only ways to create a
+// new account now. 410 Gone (not 404) because the route existed and was
+// deliberately removed, not never-existed. /api/login stays working below:
+// it's the only way the admin account (no X/Google link) can sign in, so
+// removing it too would lock the admin out entirely rather than just
+// closing new registration.
+app.post('/api/signup', (req, res) => {
+  res.status(410).json({ error: 'Email/password signup has been retired. Please continue with X or Google.' });
 });
 
 // Login API
-app.post('/api/login', async (req, res) => {
+app.post('/api/login', loginLimiter, async (req, res) => {
   try {
     const identifier = req.body.email || req.body.username;
     const password = req.body.password;
@@ -594,6 +623,107 @@ app.get('/api/me', requireAuth, (req, res) => {
     isGoogleUser: !!req.user.isGoogleUser,
     googlePfpUrl: req.user.googlePfpUrl || null
   });
+});
+
+// GET /api/admin/presence - live connection status. With no query params,
+// lists everyone currently connected (from the in-memory presenceMap - no
+// DB query at all, so this is cheap regardless of how often it's called).
+// With ?username=, checks one specific account: live presence first, and
+// last_seen from the DB as a fallback for "when were they last here" if
+// they're not connected right now.
+app.get('/api/admin/presence', requireAuth, requireAdmin, (req, res) => {
+  const { username } = req.query;
+
+  if (username) {
+    const user = db.prepare('SELECT id, username, last_seen FROM users WHERE LOWER(username) = LOWER(?)').get(username);
+    if (!user) return res.status(404).json({ error: 'No such user' });
+    const live = presenceMap.get(user.id);
+    return res.json({
+      username: user.username,
+      connected: !!live,
+      socketCount: live ? live.socketIds.size : 0,
+      connectedSince: live ? new Date(live.connectedAt).toISOString() : null,
+      lastSeen: user.last_seen || null
+    });
+  }
+
+  const connected = [];
+  for (const [userId, entry] of presenceMap.entries()) {
+    connected.push({
+      userId,
+      username: entry.username,
+      socketCount: entry.socketIds.size,
+      connectedSince: new Date(entry.connectedAt).toISOString()
+    });
+  }
+  res.json({ totalConnected: connected.length, connected });
+});
+
+// ---------- Signed stream URLs ----------
+// The LLHLS stream had zero access control - proven exploitable (a real
+// video segment was fetched from the origin with no login at all, just a
+// spoofed Referer header, bypassing the site's cookie-based auth entirely).
+// OME's SignedPolicy (Server.xml) now requires every playlist URL to carry
+// an HMAC-SHA1 signature made with this same secret. Deliberately only the
+// .m3u8 manifest is signed, not each .m4s segment: segments stay cacheable
+// and shared at Cloudflare's edge this way (measured ~78% cache hit rate
+// before this change), where per-viewer-unique signed segment URLs would
+// have collapsed that and roughly 4-5x'd origin egress - verified this
+// tradeoff before relying on it, since OME's own docs don't state whether
+// segments need signing.
+const OME_PUBLIC_HOST = 'https://biggboss24hrs.com'; // what the browser actually fetches
+const OME_STREAM_APP_PATH = '/app/stream';
+
+// CRITICAL, verified empirically (not from docs - OME's own docs don't say
+// this): the string OME signs against is NOT the public-facing URL. OME
+// sits behind nginx/Cloudflare and has no idea it's proxied, so when it
+// reconstructs the URL to verify a signature it uses ITS OWN internal
+// listening port (3333, confirmed via
+// "There is no signature key... in url(http://biggboss24hrs.com:3333/...)"
+// in its own logs) and plain http, not the public https:443 a docs example
+// assumes. nginx forwards the Host header unchanged (proxy_set_header Host
+// $host), so OME sees Host: biggboss24hrs.com + its own port. Signing with
+// :443/https here (the docs' literal example) produces a signature that
+// silently never validates - confirmed by testing both forms directly
+// against the running container before trusting either.
+const OME_INTERNAL_SIGNING_ORIGIN = 'http://biggboss24hrs.com:3333';
+
+function signOmeUrl(path, ttlMs) {
+  const policy = Buffer.from(JSON.stringify({ url_expire: Date.now() + ttlMs })).toString('base64url');
+  const signedString = `${OME_INTERNAL_SIGNING_ORIGIN}${path}?policy=${policy}`;
+  const signature = crypto.createHmac('sha1', process.env.OME_SIGNED_POLICY_KEY)
+    .update(signedString).digest('base64url');
+  // The query string (policy + signature) is what actually matters and
+  // travels through nginx/Cloudflare unchanged - the URL handed to the
+  // browser uses the real public host so it actually reaches the site.
+  return `${OME_PUBLIC_HOST}${path}?policy=${policy}&signature=${signature}`;
+}
+
+const STREAM_QUALITY_PATHS = {
+  auto:  { label: 'Auto',  path: `${OME_STREAM_APP_PATH}/llhls.m3u8` },
+  q1080: { label: '1080p', path: `${OME_STREAM_APP_PATH}/q1080.m3u8` },
+  q720:  { label: '720p',  path: `${OME_STREAM_APP_PATH}/q720.m3u8` },
+  q480:  { label: '480p',  path: `${OME_STREAM_APP_PATH}/q480.m3u8` },
+  q360:  { label: '360p',  path: `${OME_STREAM_APP_PATH}/q360.m3u8` }
+};
+
+// 12h so a long broadcast is never interrupted mid-session - url_expire
+// only gates when a NEW request can start, not sessions already playing.
+const STREAM_URL_TTL_MS = 12 * 60 * 60 * 1000;
+
+// requireAuth is the actual access-control fix: without a valid session,
+// there is no way to obtain a working stream URL at all anymore, closing
+// the hole the audit found regardless of what the rotating link gate does.
+app.get('/api/stream/urls', requireAuth, (req, res) => {
+  if (!process.env.OME_SIGNED_POLICY_KEY) {
+    console.error('[Stream URLs] OME_SIGNED_POLICY_KEY not configured');
+    return res.status(503).json({ error: 'Stream signing is not configured' });
+  }
+  const qualities = {};
+  for (const [key, { label, path }] of Object.entries(STREAM_QUALITY_PATHS)) {
+    qualities[key] = { label, url: signOmeUrl(path, STREAM_URL_TTL_MS) };
+  }
+  res.json({ qualities });
 });
 
 // ---------- Sign in with X ----------
@@ -1924,4 +2054,9 @@ app.get('/api/clips/:startSec/:durationSec/:quality/:sig.mp4', async (req, res) 
   await cutAndStreamClip(req, res, { startMs: startSec * 1000, durationSec, quality });
 });
 
-server.listen(PORT, () => console.log(`Auth server running on port ${PORT}`));
+// Bound to loopback only - nginx is the sole intended caller (it already
+// proxies here via http://127.0.0.1:4000 in every location block). This
+// was previously bound to 0.0.0.0/::, reachable from the internet with only
+// ufw standing between it and the origin IP directly - defense in depth,
+// not a fix on its own (ufw has no rule for 4000 either way).
+server.listen(PORT, '127.0.0.1', () => console.log(`Auth server running on port ${PORT} (127.0.0.1 only)`));

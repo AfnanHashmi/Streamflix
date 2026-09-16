@@ -13,9 +13,33 @@
 
 const crypto = require('crypto');
 const path   = require('path');
+const rateLimit = require('express-rate-limit');
 
 const TWENTY_FOUR_HOURS_MS = 24 * 60 * 60 * 1000;
 const NO_ACCESS_PAGE    = path.join(__dirname, 'public', 'no-access.html');
+
+// Same X-Real-IP rationale as server.js's realIp()/makeLimiter(): nginx
+// forwards CF-Connecting-IP there, and every request on 443 already came
+// through Cloudflare (ufw restricts that port to Cloudflare's ranges).
+function realIp(req) {
+  return req.headers['x-real-ip'] || req.ip;
+}
+
+// /access: unlimited before this, though the 192-bit random token makes
+// brute force computationally infeasible regardless - this is mainly
+// defense in depth. /admin/current-link: unlimited before this, and a
+// single successful guess of ADMIN_KEY leaks the live invite link,
+// defeating the whole gate - this one matters more.
+const accessLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, max: 20, keyGenerator: realIp,
+  standardHeaders: true, legacyHeaders: false,
+  message: { error: 'Too many attempts. Please try again later.' }
+});
+const adminLinkLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, max: 5, keyGenerator: realIp,
+  standardHeaders: true, legacyHeaders: false,
+  message: { error: 'Too many attempts. Please try again later.' }
+});
 
 // Module-level references (populated by initAccessTokens)
 let _db;
@@ -75,19 +99,38 @@ function verifyAccessCookie(req) {
   }
 }
 
+// A real logged-in account (349+ of them, only 12 with an OAuth-minted
+// access_session) was being bounced to no-access.html even after a
+// successful password login, because only the X/Google callbacks ever
+// called mintAccessSession() - a live bug found in the same audit that
+// found the stream hotlinking hole. Login now IS the gate: any valid
+// streamflix_session (signed with the same JWT_SECRET as access_session,
+// see initAccessTokens below) passes, independent of the rotating link.
+// streamflix_session tokens carry no `type` field (see signToken in
+// server.js), unlike access_session - just needs to verify and decode.
+function verifyUserSession(req) {
+  const token = req.cookies && req.cookies.streamflix_session;
+  if (!token) return null;
+  try {
+    return _jwt.verify(token, _jwtSecret);
+  } catch {
+    return null;
+  }
+}
+
 function requireAccessSession(req, res, next) {
-  if (verifyAccessCookie(req)) return next();
+  if (verifyAccessCookie(req) || verifyUserSession(req)) return next();
   return res.status(200).sendFile(NO_ACCESS_PAGE);
 }
 
 function gateStream(req, res, next) {
-  if (verifyAccessCookie(req)) return next();
+  if (verifyAccessCookie(req) || verifyUserSession(req)) return next();
   return res.status(403).send('Forbidden: valid access session required.');
 }
 
 // ─── Route: GET /access?token=xxx ─────────────────────────────────────────
 function registerAccessRoute(app) {
-  app.get('/access', (req, res) => {
+  app.get('/access', accessLimiter, (req, res) => {
     const { token } = req.query;
 
     if (!token) {
@@ -134,7 +177,7 @@ function registerAccessRoute(app) {
 
 // ─── Route: GET /admin/current-link?key=xxx ───────────────────────────────
 function registerAdminRoute(app, siteOrigin) {
-  app.get('/admin/current-link', (req, res) => {
+  app.get('/admin/current-link', adminLinkLimiter, (req, res) => {
     const adminKey = process.env.ADMIN_KEY;
 
     if (!adminKey) {
