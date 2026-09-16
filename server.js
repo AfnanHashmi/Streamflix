@@ -482,7 +482,6 @@ io.use((socket, next) => {
 });
 
 // 3. Socket.io Connection & History Logic
-let activeViewers = 0;
 
 // Lightweight live presence: an in-memory Map, updated only on
 // connect/disconnect (not polled, not per-message) - this is what makes
@@ -494,11 +493,25 @@ let activeViewers = 0;
 // ("if not machine heavy").
 const presenceMap = new Map(); // userId -> { username, socketIds: Set, connectedAt }
 
-io.on('connection', (socket) => {
-  activeViewers++;
-  io.emit('viewer_count', activeViewers);
+// Logged-out viewers (the rotating link admits them without an account) get
+// counted the same way - deduped by a client-generated id shared across that
+// browser's tabs via localStorage - so "Watching" reflects distinct people,
+// not raw socket connections. Without this, one person with 3 tabs open (or
+// a flaky connection reconnecting a few times) visibly inflated the count,
+// which is what made it "look fake".
+const anonPresenceMap = new Map(); // viewerId -> Set(socketIds)
 
+function broadcastViewerCount() {
+  const distinctCount = presenceMap.size + anonPresenceMap.size;
+  io.emit('viewer_count', distinctCount);
+}
+
+io.on('connection', (socket) => {
   const presenceUserId = socket.user?.id || null;
+  const anonViewerId = !presenceUserId && typeof socket.handshake.auth?.viewerId === 'string'
+    ? socket.handshake.auth.viewerId.slice(0, 64)
+    : null;
+
   if (presenceUserId) {
     let entry = presenceMap.get(presenceUserId);
     if (!entry) {
@@ -511,19 +524,31 @@ io.on('connection', (socket) => {
     } catch (err) {
       console.error('[Presence] Failed to update last_seen:', err);
     }
+  } else if (anonViewerId) {
+    let ids = anonPresenceMap.get(anonViewerId);
+    if (!ids) {
+      ids = new Set();
+      anonPresenceMap.set(anonViewerId, ids);
+    }
+    ids.add(socket.id);
   }
+  broadcastViewerCount();
 
   socket.on('disconnect', () => {
-    activeViewers = Math.max(0, activeViewers - 1);
-    io.emit('viewer_count', activeViewers);
-
     if (presenceUserId) {
       const entry = presenceMap.get(presenceUserId);
       if (entry) {
         entry.socketIds.delete(socket.id);
         if (entry.socketIds.size === 0) presenceMap.delete(presenceUserId);
       }
+    } else if (anonViewerId) {
+      const ids = anonPresenceMap.get(anonViewerId);
+      if (ids) {
+        ids.delete(socket.id);
+        if (ids.size === 0) anonPresenceMap.delete(anonViewerId);
+      }
     }
+    broadcastViewerCount();
   });
 
   const senderUsername = socket.user?.username || 'User';
