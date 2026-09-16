@@ -759,6 +759,15 @@ app.post('/api/admin/kick', requireAuth, requireAdmin, (req, res) => {
   res.json({ username: user.username, kicked });
 });
 
+// POST /api/admin/security-check - fires the anti-leak identity overlay
+// (each connected viewer sees their own X handle/email for 5s) on demand,
+// broadcast to every live socket at once. Manual/on-demand by design - a
+// leaker screen-recording won't know when it's coming.
+app.post('/api/admin/security-check', requireAuth, requireAdmin, (req, res) => {
+  io.emit('security_check');
+  res.json({ sent: true, recipients: presenceMap.size + anonPresenceMap.size });
+});
+
 // ---------- Signed stream URLs ----------
 // The LLHLS stream had zero access control - proven exploitable (a real
 // video segment was fetched from the origin with no login at all, just a
