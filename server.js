@@ -429,7 +429,16 @@ function requireAuth(req, res, next) {
   }
   if (!token) return res.status(401).json({ error: 'Not logged in' });
   try {
-    req.user = jwt.verify(token, JWT_SECRET);
+    const payload = jwt.verify(token, JWT_SECRET);
+    // Same fix as the Socket.IO auth middleware, same reason: a valid JWT
+    // signature doesn't mean the account still exists - stateless tokens
+    // stay valid until their 30-day expiry regardless of what happens to
+    // the row behind them. One indexed primary-key lookup per authenticated
+    // request; negligible next to everything else already per-request here.
+    if (!db.prepare('SELECT id FROM users WHERE id = ?').get(payload.id)) {
+      return res.status(401).json({ error: 'Account no longer exists' });
+    }
+    req.user = payload;
     next();
   } catch {
     res.status(401).json({ error: 'Invalid or expired session' });
@@ -449,7 +458,21 @@ io.use((socket, next) => {
     if (rawCookies) {
       const parsed = parseCookie(rawCookies);
       if (parsed.streamflix_session) {
-        socket.user = jwt.verify(parsed.streamflix_session, JWT_SECRET);
+        const payload = jwt.verify(parsed.streamflix_session, JWT_SECRET);
+        // A valid JWT signature alone doesn't mean the account still
+        // exists - JWTs are stateless, so a deleted account's session
+        // stays cryptographically valid until its 30-day expiry with no
+        // way to revoke it early. Found live: the Sept 16 account wipe
+        // deleted 368 accounts, and every one of them that was already
+        // connected kept showing up in chat/presence under their old
+        // identity, unrevoked. Same fix either way something's gone
+        // wrong with an account (deleted, or a future ban) - if the row
+        // isn't there, this connection reverts to fully anonymous, the
+        // same as if no cookie had been sent at all.
+        const stillExists = db.prepare('SELECT id FROM users WHERE id = ?').get(payload.id);
+        if (stillExists) {
+          socket.user = payload;
+        }
       }
     }
   } catch (err) {
