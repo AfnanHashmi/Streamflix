@@ -66,6 +66,14 @@ function realIp(req) {
   return ipKeyGenerator(req.headers['x-real-ip'] || req.ip);
 }
 
+// Same normalization as realIp() above, for a raw socket.io handshake
+// instead of an Express req - used so a banned viewer's IP (or /56 subnet,
+// for IPv6) is recorded the same way whether they arrived via HTTP or a
+// socket connection.
+function realIpFromHandshake(handshake) {
+  return ipKeyGenerator(handshake.headers['x-real-ip'] || handshake.address);
+}
+
 function makeLimiter(windowMs, max, message) {
   return rateLimit({
     windowMs,
@@ -552,15 +560,17 @@ io.on('connection', (socket) => {
     ? socket.handshake.auth.viewerId.slice(0, 64)
     : null;
   const deviceType = classifyDevice(socket.handshake.headers['user-agent']);
+  const connIp = realIpFromHandshake(socket.handshake);
 
   if (presenceUserId) {
     let entry = presenceMap.get(presenceUserId);
     if (!entry) {
-      entry = { username: socket.user.username, socketIds: new Set(), connectedAt: Date.now(), devices: new Map() };
+      entry = { username: socket.user.username, socketIds: new Set(), connectedAt: Date.now(), devices: new Map(), ips: new Set() };
       presenceMap.set(presenceUserId, entry);
     }
     entry.socketIds.add(socket.id);
     entry.devices.set(socket.id, deviceType);
+    entry.ips.add(connIp);
     try {
       db.prepare(`UPDATE users SET last_seen = datetime('now') WHERE id = ?`).run(presenceUserId);
     } catch (err) {
@@ -675,6 +685,10 @@ app.post('/api/signup', (req, res) => {
 // Login API
 app.post('/api/login', loginLimiter, async (req, res) => {
   try {
+    if (isBannedIdentity('ip', realIp(req))) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
     const identifier = req.body.email || req.body.username;
     const password = req.body.password;
 
@@ -808,7 +822,7 @@ app.post('/api/admin/security-check', requireAuth, requireAdmin, (req, res) => {
 // their current session dies on its next request even before the kick
 // lands.
 app.post('/api/admin/ban', requireAuth, requireAdmin, (req, res) => {
-  const { username, reason } = req.body || {};
+  const { username, reason, ip } = req.body || {};
   if (!username) return res.status(400).json({ error: 'username required' });
 
   const user = db.prepare('SELECT * FROM users WHERE LOWER(username) = LOWER(?)').get(username);
@@ -817,6 +831,10 @@ app.post('/api/admin/ban', requireAuth, requireAdmin, (req, res) => {
 
   let kicked = 0;
   const entry = presenceMap.get(user.id);
+  // Captured while they're still connected - this is the only source for
+  // it, since IPs are never logged anywhere else (see realIp()'s comment).
+  // Once kicked, this is gone for good, so read it before disconnecting.
+  const liveIps = entry ? [...entry.ips] : [];
   if (entry) {
     for (const socketId of entry.socketIds) {
       const socket = io.sockets.sockets.get(socketId);
@@ -829,6 +847,14 @@ app.post('/api/admin/ban', requireAuth, requireAdmin, (req, res) => {
   if (user.x_id) { banIdentity('x_id', user.x_id, reason); bannedIdentities.push('x_id'); }
   if (user.x_handle) { banIdentity('x_handle', user.x_handle, reason); bannedIdentities.push('x_handle'); }
   if (user.email && !/@x\.local$/i.test(user.email)) { banIdentity('email', user.email, reason); bannedIdentities.push('email'); }
+
+  const bannedIps = new Set(liveIps);
+  if (ip) bannedIps.add(String(ip).trim());
+  for (const bannedIp of bannedIps) {
+    if (!bannedIp) continue;
+    banIdentity('ip', bannedIp, reason);
+    bannedIdentities.push(`ip:${bannedIp}`);
+  }
 
   db.prepare('DELETE FROM users WHERE id = ?').run(user.id);
 
@@ -991,6 +1017,11 @@ app.get('/api/auth/x/callback', async (req, res) => {
   };
 
   try {
+    if (isBannedIdentity('ip', realIp(req))) {
+      res.clearCookie('x_oauth');
+      return res.redirect('/login.html?x_error=banned');
+    }
+
     const { code, state } = req.query;
     const oauthCookie = req.cookies.x_oauth;
     if (!code || !state || !oauthCookie) return failRedirect('missing code/state/cookie');
@@ -1198,6 +1229,11 @@ app.get('/api/auth/google/callback', async (req, res) => {
   };
 
   try {
+    if (isBannedIdentity('ip', realIp(req))) {
+      res.clearCookie('google_oauth');
+      return res.redirect('/login.html?g_error=banned');
+    }
+
     const { code, state } = req.query;
     const oauthCookie = req.cookies.google_oauth;
     if (!code || !state || !oauthCookie) return failRedirect('missing code/state/cookie');
