@@ -179,6 +179,15 @@ try { db.exec(`ALTER TABLE users ADD COLUMN google_id TEXT`); } catch (e) {}
 try { db.exec(`ALTER TABLE users ADD COLUMN google_name TEXT`); } catch (e) {}
 try { db.exec(`ALTER TABLE users ADD COLUMN google_pfp_url TEXT`); } catch (e) {}
 try { db.exec(`ALTER TABLE users ADD COLUMN google_linked_at TEXT`); } catch (e) {}
+// google_id alone is just a login credential - it's set both when a Google
+// sign-in links onto an existing account AND when it creates a new one, so
+// it can't be used to decide chat display. google_native is true only for
+// an account actually CREATED via Google (picked its own username/avatar in
+// the completion step) - only that drives the chat badge/blue name/photo.
+// A linked account has google_id set but google_native=0 and renders as a
+// completely ordinary user - this is what makes linking invisible, which
+// is the fix for the bug where linking silently adopted an admin's photo.
+try { db.exec(`ALTER TABLE users ADD COLUMN google_native INTEGER NOT NULL DEFAULT 0`); } catch (e) {}
 db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_google_id ON users(google_id) WHERE google_id IS NOT NULL`);
 
 try {
@@ -351,7 +360,7 @@ function signToken(user) {
       xHandle: user.x_handle || null,
       xVerified: !!user.x_verified,
       xPfpUrl: user.x_pfp_url || null,
-      isGoogleUser: !!user.google_id,
+      isGoogleUser: !!user.google_native,
       googlePfpUrl: user.google_pfp_url || null
     },
     JWT_SECRET,
@@ -436,7 +445,7 @@ io.on('connection', (socket) => {
              u.x_handle as xHandle,
              CASE WHEN u.x_verified = 1 THEN 1 ELSE 0 END as xVerified,
              u.x_pfp_url as xPfpUrl,
-             CASE WHEN u.google_id IS NOT NULL THEN 1 ELSE 0 END as isGoogleUser,
+             CASE WHEN u.google_native = 1 THEN 1 ELSE 0 END as isGoogleUser,
              u.google_pfp_url as googlePfpUrl
       FROM chat_messages cm
       LEFT JOIN users u ON LOWER(cm.username) = LOWER(u.username)
@@ -931,49 +940,61 @@ app.get('/api/auth/google/callback', async (req, res) => {
     const googlePfpUrl = normalizeGooglePfp(googleUser.picture);
 
     const resolveAccount = db.transaction(() => {
-      // 1. Returning Google user - refresh name/picture on every login,
-      // same free-refresh rationale as X's returning-login branch.
+      // 1. Returning Google user - refresh name unconditionally, but only
+      // refresh the picture if one was already stored. A null
+      // google_pfp_url means either "linked account" or "chose skip at
+      // signup" - both must stay null forever, never silently
+      // repopulated the next time this person logs in.
       const existing = db.prepare('SELECT * FROM users WHERE google_id = ?').get(googleId);
       if (existing) {
-        db.prepare('UPDATE users SET google_name = ?, google_pfp_url = ? WHERE id = ?')
-          .run(googleName, googlePfpUrl, existing.id);
+        db.prepare(`
+          UPDATE users SET google_name = ?,
+            google_pfp_url = CASE WHEN google_pfp_url IS NOT NULL THEN ? ELSE NULL END
+          WHERE id = ?
+        `).run(googleName, googlePfpUrl, existing.id);
         return { user: db.prepare('SELECT * FROM users WHERE id = ?').get(existing.id), outcome: 'login' };
       }
 
       // 2. Real verified email matches an existing account - link Google
-      // onto it rather than creating a duplicate. Purely additive: never
-      // touches password_hash, username, or chat history, so a password
-      // login for that account keeps working exactly as before.
+      // onto it rather than creating a duplicate. Grants a login method
+      // ONLY: no name, no picture, google_native stays at its default 0,
+      // so this account keeps rendering exactly as it did before - the fix
+      // for the bug where linking silently adopted the admin's Google
+      // photo and would-be badge. Never touches password_hash, username,
+      // or chat history either.
       const byEmail = db.prepare('SELECT * FROM users WHERE LOWER(email) = LOWER(?)').get(googleEmail);
       if (byEmail) {
-        db.prepare(`
-          UPDATE users SET google_id = ?, google_name = ?, google_pfp_url = ?, google_linked_at = datetime('now')
-          WHERE id = ?
-        `).run(googleId, googleName, googlePfpUrl, byEmail.id);
+        db.prepare(`UPDATE users SET google_id = ?, google_linked_at = datetime('now') WHERE id = ?`)
+          .run(googleId, byEmail.id);
         return { user: db.prepare('SELECT * FROM users WHERE id = ?').get(byEmail.id), outcome: 'linked' };
       }
 
-      // 3. New account. No eviction path exists here - a username
-      // collision is always resolved by suffixing, never by displacing
-      // whoever already holds the name.
-      let candidate = deriveGoogleUsername(googleEmail);
-      if (RESERVED_USERNAMES.includes(candidate.toLowerCase())) candidate += '_g';
-      let username = candidate;
-      let n = 2;
-      while (db.prepare('SELECT id FROM users WHERE LOWER(username) = LOWER(?)').get(username)) {
-        username = candidate + (n++);
-      }
-
-      const placeholderHash = bcrypt.hashSync(crypto.randomBytes(32).toString('hex'), 12);
-      const info = db.prepare(`
-        INSERT INTO users (username, email, password_hash, role, is_admin, google_id, google_name, google_pfp_url, google_linked_at)
-        VALUES (?, ?, ?, 'user', 0, ?, ?, ?, datetime('now'))
-      `).run(username, googleEmail, placeholderHash, googleId, googleName, googlePfpUrl);
-
-      return { user: db.prepare('SELECT * FROM users WHERE id = ?').get(info.lastInsertRowid), outcome: 'signup' };
+      return { outcome: 'new' };
     });
 
     const result = resolveAccount();
+
+    if (result.outcome === 'new') {
+      // Don't create the account yet - let the user pick their own
+      // username and whether to show their Google photo first (see
+      // GET /api/auth/google/pending and POST /api/auth/google/complete).
+      // Same ephemeral-signed-cookie pattern as google_oauth above.
+      const suggested = deriveGoogleUsername(googleEmail);
+      const suggestedUsername = RESERVED_USERNAMES.includes(suggested.toLowerCase()) ? suggested + '_g' : suggested;
+      const pendingJwt = jwt.sign(
+        { type: 'google_pending', googleId, googleEmail, googleName, googlePfpUrl, suggestedUsername },
+        JWT_SECRET,
+        { expiresIn: '15m' }
+      );
+      res.cookie('google_pending', pendingJwt, {
+        httpOnly: true,
+        secure: IS_PROD,
+        path: '/',
+        sameSite: 'lax',
+        maxAge: 15 * 60 * 1000
+      });
+      return res.redirect('/complete-signup.html');
+    }
 
     const token = signToken(result.user);
     setAuthCookie(res, token);
@@ -983,6 +1004,74 @@ app.get('/api/auth/google/callback', async (req, res) => {
     return res.redirect('/live');
   } catch (err) {
     return failRedirect(err.message || err);
+  }
+});
+
+// GET: the completion page's data source - suggested username, name, and
+// picture preview, read from the (non-secret) pending cookie without
+// exposing its raw signed contents to client JS.
+app.get('/api/auth/google/pending', (req, res) => {
+  const cookie = req.cookies.google_pending;
+  if (!cookie) return res.status(400).json({ error: 'No pending Google sign-in.' });
+  try {
+    const p = jwt.verify(cookie, JWT_SECRET);
+    if (p.type !== 'google_pending') throw new Error('wrong type');
+    res.json({ suggestedUsername: p.suggestedUsername, pfpUrl: p.googlePfpUrl, name: p.googleName });
+  } catch {
+    res.status(400).json({ error: 'Your sign-in session expired. Please try again.' });
+  }
+});
+
+// POST: finalizes a new Google account with the username and avatar choice
+// the user actually made, replacing the old auto-suffix/auto-photo path.
+app.post('/api/auth/google/complete', (req, res) => {
+  const cookie = req.cookies.google_pending;
+  if (!cookie) return res.status(400).json({ error: 'No pending Google sign-in. Please sign in again.' });
+
+  let payload;
+  try {
+    payload = jwt.verify(cookie, JWT_SECRET);
+    if (payload.type !== 'google_pending') throw new Error('wrong type');
+  } catch {
+    return res.status(400).json({ error: 'Your sign-in session expired. Please sign in again.' });
+  }
+
+  try {
+    const cleanUsername = String((req.body || {}).username || '').trim();
+    const useAvatar = !!(req.body || {}).useAvatar;
+    if (!cleanUsername) return res.status(400).json({ error: 'Username is required.' });
+    if (RESERVED_USERNAMES.includes(cleanUsername.toLowerCase())) {
+      return res.status(403).json({ error: 'This username is reserved.' });
+    }
+    if (db.prepare('SELECT id FROM users WHERE LOWER(username) = LOWER(?)').get(cleanUsername)) {
+      return res.status(409).json({ error: 'That username is already taken.' });
+    }
+    // Re-check for a race between /start and /complete - another signup or
+    // link could have claimed this identity in the 15-minute window.
+    if (
+      db.prepare('SELECT id FROM users WHERE google_id = ?').get(payload.googleId) ||
+      db.prepare('SELECT id FROM users WHERE LOWER(email) = LOWER(?)').get(payload.googleEmail)
+    ) {
+      return res.status(409).json({ error: 'This Google account is already linked. Please sign in again.' });
+    }
+
+    const finalPfpUrl = useAvatar ? payload.googlePfpUrl : null;
+    const placeholderHash = bcrypt.hashSync(crypto.randomBytes(32).toString('hex'), 12);
+    const info = db.prepare(`
+      INSERT INTO users (username, email, password_hash, role, is_admin, google_id, google_name, google_pfp_url, google_native, google_linked_at)
+      VALUES (?, ?, ?, 'user', 0, ?, ?, ?, 1, datetime('now'))
+    `).run(cleanUsername, payload.googleEmail, placeholderHash, payload.googleId, payload.googleName, finalPfpUrl);
+
+    const user = db.prepare('SELECT * FROM users WHERE id = ?').get(info.lastInsertRowid);
+    const token = signToken(user);
+    setAuthCookie(res, token);
+    mintAccessSession(res);
+    res.clearCookie('google_pending');
+    console.log(`[Google Signup] New account "${cleanUsername}" completed for ${payload.googleEmail} (avatar=${useAvatar}).`);
+    res.json({ success: true, redirect: '/live' });
+  } catch (err) {
+    console.error('[Google Signup] Complete failed:', err);
+    res.status(500).json({ error: 'Something went wrong finishing sign-in. Please try again.' });
   }
 });
 
