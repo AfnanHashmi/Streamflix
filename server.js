@@ -1759,10 +1759,40 @@ function clipRecordBytes(userId, bytes) {
 // the default) picks the tallest available - the bypass track, full quality,
 // for an actual Download.
 async function getClipSourceChunklists(quality) {
-  const masterUrl = `${CLIP_ORIGIN}/${CLIP_STREAM_NAME}/llhls.m3u8`;
-  const res = await fetch(masterUrl);
-  if (!res.ok) throw new Error(`Master manifest fetch failed: ${res.status}`);
-  const text = await res.text();
+  // SignedPolicy now gates the manifest (not chunklists/segments), so this
+  // loopback fetch needs a signature too - it was missed in the original
+  // rollout since only the browser-facing path (/api/stream/urls) and RTMP
+  // publish were tested. Reuse signOmeUrl's query string (computed against
+  // OME_INTERNAL_SIGNING_ORIGIN, which is what OME actually verifies
+  // against) but keep fetching over loopback - CLIP_ORIGIN exists
+  // specifically to avoid a round trip through Cloudflare/nginx for every
+  // clip cut. Uses http.request rather than fetch() because fetch silently
+  // drops a custom Host header (a spec-forbidden header) - confirmed by a
+  // direct test where fetch's override was ignored (401) but an identical
+  // http.request with the same header succeeded (200). OME needs that
+  // header to know which virtual host's signing key to verify against,
+  // since the loopback request otherwise arrives as Host: 127.0.0.1:3333.
+  const signedQuery = signOmeUrl(`/app/${CLIP_STREAM_NAME}/llhls.m3u8`, 5 * 60 * 1000).split('?')[1];
+  const masterPath = `/app/${CLIP_STREAM_NAME}/llhls.m3u8?${signedQuery}`;
+  const text = await new Promise((resolve, reject) => {
+    const req = http.request({
+      hostname: '127.0.0.1',
+      port: 3333,
+      path: masterPath,
+      method: 'GET',
+      headers: { Host: 'biggboss24hrs.com' }
+    }, (res) => {
+      if (res.statusCode !== 200) {
+        res.resume();
+        return reject(new Error(`Master manifest fetch failed: ${res.statusCode}`));
+      }
+      let body = '';
+      res.on('data', (d) => { body += d; });
+      res.on('end', () => resolve(body));
+    });
+    req.on('error', reject);
+    req.end();
+  });
   const lines = text.split('\n').map(l => l.trim());
 
   let audioChunklist = null;
