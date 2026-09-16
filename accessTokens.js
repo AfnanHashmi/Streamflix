@@ -21,8 +21,14 @@ const NO_ACCESS_PAGE    = path.join(__dirname, 'public', 'no-access.html');
 // Same X-Real-IP rationale as server.js's realIp()/makeLimiter(): nginx
 // forwards CF-Connecting-IP there, and every request on 443 already came
 // through Cloudflare (ufw restricts that port to Cloudflare's ranges).
+// Routed through ipKeyGenerator so an IPv6 client can't bypass the limit
+// by rotating addresses within their own /64 - see server.js's realIp()
+// for the fuller explanation (same fix, same reason, caught by
+// express-rate-limit's own startup validation in both files).
+const { ipKeyGenerator } = rateLimit;
+
 function realIp(req) {
-  return req.headers['x-real-ip'] || req.ip;
+  return ipKeyGenerator(req.headers['x-real-ip'] || req.ip);
 }
 
 // /access: unlimited before this, though the 192-bit random token makes

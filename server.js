@@ -51,8 +51,19 @@ app.use(cors({
 // header is always authoritative here, unlike trusting X-Forwarded-For's
 // chain math. Falls back to req.ip only if the header is ever missing
 // (e.g. a direct loopback request during local testing).
+//
+// Routed through express-rate-limit's own ipKeyGenerator rather than used
+// raw: a bare IPv6 address is a near-useless rate-limit key on its own,
+// since one client can trivially rotate through billions of addresses
+// inside their own /64 - ipKeyGenerator collapses that to a /56 subnet so
+// the limit actually holds. (v4 addresses pass through unchanged.) Caught
+// this from the library's own startup validation, not the docs - it
+// refuses to start with a custom keyGenerator that looks like it skips
+// this, exactly to stop this class of bypass from shipping unnoticed.
+const { ipKeyGenerator } = rateLimit;
+
 function realIp(req) {
-  return req.headers['x-real-ip'] || req.ip;
+  return ipKeyGenerator(req.headers['x-real-ip'] || req.ip);
 }
 
 function makeLimiter(windowMs, max, message) {
