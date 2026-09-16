@@ -718,6 +718,34 @@ app.get('/api/admin/presence', requireAuth, requireAdmin, (req, res) => {
   res.json({ totalConnected: connected.length, connected });
 });
 
+// POST /api/admin/kick { username } - force-disconnects every live socket
+// for that user right now, no restart needed. Their session stays valid
+// (this isn't a ban - jwt.verify still passes and the account still exists
+// in the DB), so they can simply reconnect; use the DB-existence check
+// path (deleting the account) for a permanent removal instead.
+app.post('/api/admin/kick', requireAuth, requireAdmin, (req, res) => {
+  const { username } = req.body || {};
+  if (!username) return res.status(400).json({ error: 'username required' });
+
+  const user = db.prepare('SELECT id, username FROM users WHERE LOWER(username) = LOWER(?)').get(username);
+  if (!user) return res.status(404).json({ error: 'No such user' });
+
+  const entry = presenceMap.get(user.id);
+  if (!entry || entry.socketIds.size === 0) {
+    return res.json({ username: user.username, kicked: 0, message: 'Not currently connected' });
+  }
+
+  let kicked = 0;
+  for (const socketId of entry.socketIds) {
+    const socket = io.sockets.sockets.get(socketId);
+    if (socket) {
+      socket.disconnect(true);
+      kicked++;
+    }
+  }
+  res.json({ username: user.username, kicked });
+});
+
 // ---------- Signed stream URLs ----------
 // The LLHLS stream had zero access control - proven exploitable (a real
 // video segment was fetched from the origin with no login at all, just a
