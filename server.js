@@ -168,6 +168,19 @@ try { db.exec(`ALTER TABLE users ADD COLUMN x_linked_at TEXT`); } catch (e) {}
 try { db.exec(`ALTER TABLE users ADD COLUMN x_pfp_url TEXT`); } catch (e) {}
 db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_x_id ON users(x_id) WHERE x_id IS NOT NULL`);
 
+// Sign in with Google: unlike X, Google gives a real verified email, so a
+// sign-in matching an existing account's email links onto it rather than
+// creating a duplicate - see the resolveAccount transaction in the Google
+// callback route. No google_verified column: no such concept exists for a
+// consumer Google account. No google_email column either: users.email IS
+// the real Google email on first signup, and a linked row's users.email
+// already equals it by definition (that's how the match was found).
+try { db.exec(`ALTER TABLE users ADD COLUMN google_id TEXT`); } catch (e) {}
+try { db.exec(`ALTER TABLE users ADD COLUMN google_name TEXT`); } catch (e) {}
+try { db.exec(`ALTER TABLE users ADD COLUMN google_pfp_url TEXT`); } catch (e) {}
+try { db.exec(`ALTER TABLE users ADD COLUMN google_linked_at TEXT`); } catch (e) {}
+db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_google_id ON users(google_id) WHERE google_id IS NOT NULL`);
+
 try {
   db.exec(`ALTER TABLE polls ADD COLUMN closes_at DATETIME`);
 } catch (e) {}
@@ -337,7 +350,9 @@ function signToken(user) {
       isXUser: !!user.x_id,
       xHandle: user.x_handle || null,
       xVerified: !!user.x_verified,
-      xPfpUrl: user.x_pfp_url || null
+      xPfpUrl: user.x_pfp_url || null,
+      isGoogleUser: !!user.google_id,
+      googlePfpUrl: user.google_pfp_url || null
     },
     JWT_SECRET,
     { expiresIn: '30d' }
@@ -408,6 +423,8 @@ io.on('connection', (socket) => {
   const senderXHandle = socket.user?.xHandle || null;
   const isSenderXVerified = !!socket.user?.xVerified;
   const senderXPfpUrl = socket.user?.xPfpUrl || null;
+  const isSenderGoogle = !!socket.user?.isGoogleUser;
+  const senderGooglePfpUrl = socket.user?.googlePfpUrl || null;
 
   // Send the past 24 hours of messages with admin flags to the newly connected user
   try {
@@ -418,7 +435,9 @@ io.on('connection', (socket) => {
              CASE WHEN u.x_id IS NOT NULL THEN 1 ELSE 0 END as isXUser,
              u.x_handle as xHandle,
              CASE WHEN u.x_verified = 1 THEN 1 ELSE 0 END as xVerified,
-             u.x_pfp_url as xPfpUrl
+             u.x_pfp_url as xPfpUrl,
+             CASE WHEN u.google_id IS NOT NULL THEN 1 ELSE 0 END as isGoogleUser,
+             u.google_pfp_url as googlePfpUrl
       FROM chat_messages cm
       LEFT JOIN users u ON LOWER(cm.username) = LOWER(u.username)
       WHERE cm.created_at >= datetime('now', '-24 hours')
@@ -454,7 +473,9 @@ io.on('connection', (socket) => {
         isXUser: isSenderX,
         xHandle: senderXHandle,
         xVerified: isSenderXVerified,
-        xPfpUrl: senderXPfpUrl
+        xPfpUrl: senderXPfpUrl,
+        isGoogleUser: isSenderGoogle,
+        googlePfpUrl: senderGooglePfpUrl
       });
     } catch (err) {
       console.error('Failed to save chat message:', err);
@@ -560,7 +581,9 @@ app.get('/api/me', requireAuth, (req, res) => {
     isXUser: !!req.user.isXUser,
     xHandle: req.user.xHandle || null,
     xVerified: !!req.user.xVerified,
-    xPfpUrl: req.user.xPfpUrl || null
+    xPfpUrl: req.user.xPfpUrl || null,
+    isGoogleUser: !!req.user.isGoogleUser,
+    googlePfpUrl: req.user.googlePfpUrl || null
   });
 });
 
@@ -592,13 +615,14 @@ function normalizeXPfp(url) {
 
 // The site sits behind an invite-link gate (requireAccessSession, only
 // applied to '/', '/index.html', '/live', '/live/index.html' - see the top
-// of this file). A freshly X-authed user has no access_session cookie yet,
-// so without this they'd be redirected straight into no-access.html despite
-// having just proven who they are. Mirrors the cookie accessTokens.js's
-// /access route sets (registerAccessRoute), but X sign-in is an independent,
-// permanent door into the site (nothing gates this route anymore - see
-// /api/auth/x/callback below), so it mints its own 24h session rather than
-// depending on the shared rotating invite token.
+// of this file). A freshly OAuth-authed user has no access_session cookie
+// yet, so without this they'd be redirected straight into no-access.html
+// despite having just proven who they are. Mirrors the cookie
+// accessTokens.js's /access route sets (registerAccessRoute), but OAuth
+// sign-in (X or Google) is an independent, permanent door into the site
+// (nothing gates either callback route - see /api/auth/x/callback and
+// /api/auth/google/callback below), so it mints its own 24h session rather
+// than depending on the shared rotating invite token.
 function mintAccessSession(res) {
   const sessionJwt = jwt.sign({ type: 'access_session' }, JWT_SECRET, { expiresIn: '24h' });
   res.cookie('access_session', sessionJwt, {
@@ -725,14 +749,18 @@ app.get('/api/auth/x/callback', async (req, res) => {
         return { user: refreshed, outcome: 'login' };
       }
 
-      // 2. Name clash. Admins and already-X-linked accounts are never
-      // displaced. Anyone else loses the handle to its proven owner - this
-      // is the actual anti-impersonation mechanism the feature exists for.
+      // 2. Name clash. Admins and any account already linked to an OAuth
+      // provider (X or Google) are never displaced. Anyone else loses the
+      // handle to its proven owner - this is the actual anti-impersonation
+      // mechanism the feature exists for. Google accounts don't have a
+      // public handle, so they never trigger this eviction themselves -
+      // this check only protects them from being evicted BY an X sign-in
+      // whose handle happens to coincide with a Google-derived username.
       const clash = db.prepare('SELECT * FROM users WHERE LOWER(username) = LOWER(?)').get(xHandle);
       if (clash) {
         const clashIsAdmin = clash.role === 'admin' || !!clash.is_admin;
         if (clashIsAdmin) return { outcome: 'admin_clash' };
-        if (clash.x_id) return { outcome: 'x_clash' };
+        if (clash.x_id || clash.google_id) return { outcome: 'x_clash' };
 
         // chat_history re-derives isAdmin/isXUser via a live join on
         // username (see the socket connection handler above) - leaving the
@@ -772,6 +800,186 @@ app.get('/api/auth/x/callback', async (req, res) => {
     mintAccessSession(res);
 
     console.log(`[X Signup] ${result.outcome === 'signup' ? 'New' : 'Returning'} X user @${xHandle} (verified=${!!xVerified}) logged in.`);
+    return res.redirect('/live');
+  } catch (err) {
+    return failRedirect(err.message || err);
+  }
+});
+
+// ---------- Sign in with Google ----------
+// Structurally mirrors Sign in with X above, but Google gives a real
+// verified email (X never does) and no public handle. That changes the
+// account-resolution shape: a matching email links onto an existing
+// account instead of creating a duplicate, and a username collision on a
+// brand-new account is resolved by suffixing, never by evicting anyone -
+// there's no public handle here for a real person to have proven ownership
+// of, so X's eviction argument doesn't transfer. No cost either: unlike
+// X's $0.010/flow, Google's OAuth and userinfo calls are free.
+const GOOGLE_AUTHORIZE_URL = 'https://accounts.google.com/o/oauth2/v2/auth';
+const GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token';
+const GOOGLE_USERINFO_URL = 'https://openidconnect.googleapis.com/v1/userinfo';
+
+// Google's photo URLs live on *.googleusercontent.com and take an optional
+// "=sNN-c" size/crop suffix. Strip any existing suffix, then request a 96px
+// square crop - a bit larger than the 28px render size, for retina. Same
+// host-allowlisting rationale as normalizeXPfp: this string lands in an
+// <img src> on every viewer's page.
+function normalizeGooglePfp(url) {
+  if (typeof url !== 'string' || !/^https:\/\/([a-z0-9-]+\.)?googleusercontent\.com\//.test(url)) return null;
+  return url.replace(/=s\d+-c$/, '') + '=s96-c';
+}
+
+// Google gives no handle to lock a username to, so one is derived from the
+// email's local part. Collisions are resolved by the caller appending an
+// incrementing suffix - see the "new account" branch below.
+function deriveGoogleUsername(email) {
+  return (email.split('@')[0].replace(/[^a-zA-Z0-9_]/g, '') || 'user');
+}
+
+app.get('/api/auth/google/start', (req, res) => {
+  if (!process.env.GOOGLE_CLIENT_ID || !process.env.GOOGLE_REDIRECT_URI) {
+    console.error('[Google Signup] GOOGLE_CLIENT_ID/GOOGLE_REDIRECT_URI not configured');
+    return res.status(503).send('Google sign-in is not configured');
+  }
+
+  const state = base64url(crypto.randomBytes(24));
+  const codeVerifier = base64url(crypto.randomBytes(32));
+  const codeChallenge = base64url(crypto.createHash('sha256').update(codeVerifier).digest());
+
+  // Same ephemeral-cookie pattern as x_oauth above - a signed, short-expiry
+  // JWT rather than a new DB table + sweeper.
+  const oauthJwt = jwt.sign({ type: 'google_oauth', state, codeVerifier }, JWT_SECRET, { expiresIn: '10m' });
+  res.cookie('google_oauth', oauthJwt, {
+    httpOnly: true,
+    secure: IS_PROD,
+    path: '/',
+    sameSite: 'lax',
+    maxAge: 10 * 60 * 1000
+  });
+
+  const params = new URLSearchParams({
+    response_type: 'code',
+    client_id: process.env.GOOGLE_CLIENT_ID,
+    redirect_uri: process.env.GOOGLE_REDIRECT_URI,
+    scope: 'openid email profile',
+    state,
+    code_challenge: codeChallenge,
+    code_challenge_method: 'S256'
+  });
+  res.redirect(`${GOOGLE_AUTHORIZE_URL}?${params.toString()}`);
+});
+
+app.get('/api/auth/google/callback', async (req, res) => {
+  const failRedirect = (reason) => {
+    console.error('[Google Signup] Callback failed:', reason);
+    res.clearCookie('google_oauth');
+    return res.redirect('/login.html?g_error=1');
+  };
+
+  try {
+    const { code, state } = req.query;
+    const oauthCookie = req.cookies.google_oauth;
+    if (!code || !state || !oauthCookie) return failRedirect('missing code/state/cookie');
+
+    let oauthPayload;
+    try {
+      oauthPayload = jwt.verify(oauthCookie, JWT_SECRET);
+    } catch {
+      return failRedirect('invalid or expired google_oauth cookie');
+    }
+    if (oauthPayload.type !== 'google_oauth' || oauthPayload.state !== state) {
+      return failRedirect('state mismatch');
+    }
+    res.clearCookie('google_oauth');
+
+    // ---- Token exchange - client_secret goes in the POST body for Google
+    // (X instead uses an Authorization: Basic header - the one concrete
+    // mechanical difference between the two token exchanges). ----
+    const tokenRes = await fetch(GOOGLE_TOKEN_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        code: String(code),
+        client_id: process.env.GOOGLE_CLIENT_ID,
+        client_secret: process.env.GOOGLE_CLIENT_SECRET,
+        redirect_uri: process.env.GOOGLE_REDIRECT_URI,
+        grant_type: 'authorization_code',
+        code_verifier: oauthPayload.codeVerifier
+      }),
+      signal: AbortSignal.timeout(5000)
+    });
+    if (!tokenRes.ok) return failRedirect(`token exchange ${tokenRes.status}`);
+    const tokenJson = await tokenRes.json();
+    const googleAccessToken = tokenJson.access_token;
+    if (!googleAccessToken) return failRedirect('no access_token in token response');
+
+    // Same shape as X: use the access token to call a profile endpoint
+    // directly rather than parsing an ID token JWT, so the two provider
+    // flows stay structurally identical. Free - no per-call cost like X.
+    const meRes = await fetch(GOOGLE_USERINFO_URL, {
+      headers: { Authorization: `Bearer ${googleAccessToken}` },
+      signal: AbortSignal.timeout(5000)
+    });
+    if (!meRes.ok) return failRedirect(`userinfo ${meRes.status}`);
+    const googleUser = await meRes.json();
+    if (!googleUser || !googleUser.sub || !googleUser.email) return failRedirect('malformed userinfo response');
+    // googleAccessToken is discarded here - nothing else in this route touches Google again.
+
+    const googleId = String(googleUser.sub);
+    const googleEmail = googleUser.email;
+    const googleName = googleUser.name || googleEmail;
+    const googlePfpUrl = normalizeGooglePfp(googleUser.picture);
+
+    const resolveAccount = db.transaction(() => {
+      // 1. Returning Google user - refresh name/picture on every login,
+      // same free-refresh rationale as X's returning-login branch.
+      const existing = db.prepare('SELECT * FROM users WHERE google_id = ?').get(googleId);
+      if (existing) {
+        db.prepare('UPDATE users SET google_name = ?, google_pfp_url = ? WHERE id = ?')
+          .run(googleName, googlePfpUrl, existing.id);
+        return { user: db.prepare('SELECT * FROM users WHERE id = ?').get(existing.id), outcome: 'login' };
+      }
+
+      // 2. Real verified email matches an existing account - link Google
+      // onto it rather than creating a duplicate. Purely additive: never
+      // touches password_hash, username, or chat history, so a password
+      // login for that account keeps working exactly as before.
+      const byEmail = db.prepare('SELECT * FROM users WHERE LOWER(email) = LOWER(?)').get(googleEmail);
+      if (byEmail) {
+        db.prepare(`
+          UPDATE users SET google_id = ?, google_name = ?, google_pfp_url = ?, google_linked_at = datetime('now')
+          WHERE id = ?
+        `).run(googleId, googleName, googlePfpUrl, byEmail.id);
+        return { user: db.prepare('SELECT * FROM users WHERE id = ?').get(byEmail.id), outcome: 'linked' };
+      }
+
+      // 3. New account. No eviction path exists here - a username
+      // collision is always resolved by suffixing, never by displacing
+      // whoever already holds the name.
+      let candidate = deriveGoogleUsername(googleEmail);
+      if (RESERVED_USERNAMES.includes(candidate.toLowerCase())) candidate += '_g';
+      let username = candidate;
+      let n = 2;
+      while (db.prepare('SELECT id FROM users WHERE LOWER(username) = LOWER(?)').get(username)) {
+        username = candidate + (n++);
+      }
+
+      const placeholderHash = bcrypt.hashSync(crypto.randomBytes(32).toString('hex'), 12);
+      const info = db.prepare(`
+        INSERT INTO users (username, email, password_hash, role, is_admin, google_id, google_name, google_pfp_url, google_linked_at)
+        VALUES (?, ?, ?, 'user', 0, ?, ?, ?, datetime('now'))
+      `).run(username, googleEmail, placeholderHash, googleId, googleName, googlePfpUrl);
+
+      return { user: db.prepare('SELECT * FROM users WHERE id = ?').get(info.lastInsertRowid), outcome: 'signup' };
+    });
+
+    const result = resolveAccount();
+
+    const token = signToken(result.user);
+    setAuthCookie(res, token);
+    mintAccessSession(res);
+
+    console.log(`[Google Signup] ${result.outcome} for ${googleEmail} (user id ${result.user.id}).`);
     return res.redirect('/live');
   } catch (err) {
     return failRedirect(err.message || err);
