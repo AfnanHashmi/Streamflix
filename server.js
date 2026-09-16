@@ -229,6 +229,38 @@ try { db.exec(`ALTER TABLE users ADD COLUMN google_linked_at TEXT`); } catch (e)
 try { db.exec(`ALTER TABLE users ADD COLUMN google_native INTEGER NOT NULL DEFAULT 0`); } catch (e) {}
 db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_google_id ON users(google_id) WHERE google_id IS NOT NULL`);
 
+// A deleted account can otherwise just sign up again through the same
+// OAuth identity, since X/Google callbacks only ever check "does this
+// google_id/x_id exist as a user" - not "was it ever banned". This table
+// is checked independently of the users table so a ban survives account
+// deletion. Keyed by identity_type+identity_value so one ban action can
+// cover google_id, x_id, and email all at once for whichever the account
+// actually had.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS banned_identities (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    identity_type TEXT NOT NULL,
+    identity_value TEXT NOT NULL,
+    reason TEXT,
+    banned_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(identity_type, identity_value)
+  );
+`);
+
+function isBannedIdentity(type, value) {
+  if (!value) return false;
+  return !!db.prepare('SELECT 1 FROM banned_identities WHERE identity_type = ? AND LOWER(identity_value) = LOWER(?)')
+    .get(type, String(value));
+}
+
+function banIdentity(type, value, reason) {
+  if (!value) return;
+  db.prepare(`
+    INSERT INTO banned_identities (identity_type, identity_value, reason) VALUES (?, ?, ?)
+    ON CONFLICT(identity_type, identity_value) DO NOTHING
+  `).run(type, String(value), reason || null);
+}
+
 // One cheap write per socket connect (not per message, not polled) - this
 // is what makes "is user X watching" answerable at all, which previously
 // required grepping chat/poll history for indirect evidence.
@@ -768,6 +800,42 @@ app.post('/api/admin/security-check', requireAuth, requireAdmin, (req, res) => {
   res.json({ sent: true, recipients: presenceMap.size + anonPresenceMap.size });
 });
 
+// POST /api/admin/ban { username, reason? } - the actual permanent removal:
+// kicks their live sockets, bans every OAuth identity the account had
+// (google_id/x_id/x_handle/email - whichever exist), then deletes the row.
+// Banning happens BEFORE the delete so the identity values are still on
+// hand; the account-existence check already deployed this session means
+// their current session dies on its next request even before the kick
+// lands.
+app.post('/api/admin/ban', requireAuth, requireAdmin, (req, res) => {
+  const { username, reason } = req.body || {};
+  if (!username) return res.status(400).json({ error: 'username required' });
+
+  const user = db.prepare('SELECT * FROM users WHERE LOWER(username) = LOWER(?)').get(username);
+  if (!user) return res.status(404).json({ error: 'No such user' });
+  if (user.role === 'admin' || user.is_admin) return res.status(400).json({ error: 'Refusing to ban an admin account' });
+
+  let kicked = 0;
+  const entry = presenceMap.get(user.id);
+  if (entry) {
+    for (const socketId of entry.socketIds) {
+      const socket = io.sockets.sockets.get(socketId);
+      if (socket) { socket.disconnect(true); kicked++; }
+    }
+  }
+
+  const bannedIdentities = [];
+  if (user.google_id) { banIdentity('google_id', user.google_id, reason); bannedIdentities.push('google_id'); }
+  if (user.x_id) { banIdentity('x_id', user.x_id, reason); bannedIdentities.push('x_id'); }
+  if (user.x_handle) { banIdentity('x_handle', user.x_handle, reason); bannedIdentities.push('x_handle'); }
+  if (user.email && !/@x\.local$/i.test(user.email)) { banIdentity('email', user.email, reason); bannedIdentities.push('email'); }
+
+  db.prepare('DELETE FROM users WHERE id = ?').run(user.id);
+
+  console.log(`[Admin Ban] "${user.username}" (id ${user.id}) banned and deleted. Identities: ${bannedIdentities.join(', ') || 'none'}. Reason: ${reason || 'unspecified'}`);
+  res.json({ username: user.username, kicked, bannedIdentities, deleted: true });
+});
+
 // ---------- Signed stream URLs ----------
 // The LLHLS stream had zero access control - proven exploitable (a real
 // video segment was fetched from the origin with no login at all, just a
@@ -983,6 +1051,11 @@ app.get('/api/auth/x/callback', async (req, res) => {
     const xVerified = xUser.verified === true ? 1 : 0;
     const xPfpUrl = normalizeXPfp(xUser.profile_image_url);
 
+    if (isBannedIdentity('x_id', xId) || isBannedIdentity('x_handle', xHandle)) {
+      res.clearCookie('x_oauth');
+      return res.redirect('/login.html?x_error=banned');
+    }
+
     const resolveAccount = db.transaction(() => {
       // 1. Returning X user - refresh everything X gave us on every login
       // (handle, name, verified, picture). This is free: users/me already
@@ -1177,6 +1250,11 @@ app.get('/api/auth/google/callback', async (req, res) => {
     const googleEmail = googleUser.email;
     const googleName = googleUser.name || googleEmail;
     const googlePfpUrl = normalizeGooglePfp(googleUser.picture);
+
+    if (isBannedIdentity('google_id', googleId) || isBannedIdentity('email', googleEmail)) {
+      res.clearCookie('google_oauth');
+      return res.redirect('/login.html?g_error=banned');
+    }
 
     const resolveAccount = db.transaction(() => {
       // 1. Returning Google user - refresh name unconditionally, but only
