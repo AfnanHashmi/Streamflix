@@ -493,12 +493,17 @@ function requireAdmin(req, res, next) {
 
 // ---------- Socket.IO Middleware & Events ----------
 io.use((socket, next) => {
+  // Held outside the row-existence check below on purpose: a ban deletes the
+  // row, so for the one connection this most needs to identify, socket.user
+  // is never set. The JWT is the only surviving record of who they are.
+  let tokenPayload = null;
   try {
     const rawCookies = socket.handshake.headers.cookie;
     if (rawCookies) {
       const parsed = parseCookie(rawCookies);
       if (parsed.streamflix_session) {
         const payload = jwt.verify(parsed.streamflix_session, JWT_SECRET);
+        tokenPayload = payload;
         // A valid JWT signature alone doesn't mean the account still
         // exists - JWTs are stateless, so a deleted account's session
         // stays cryptographically valid until its 30-day expiry with no
@@ -518,6 +523,35 @@ io.use((socket, next) => {
   } catch (err) {
     // Ignore invalid token, socket.user remains undefined
   }
+
+  // Bans are enforced here too, not just on the HTTP routes. Without this a
+  // banned viewer simply reconnects as an anonymous socket and keeps
+  // receiving chat and viewer counts. Identity values come off the JWT
+  // payload because the row itself is already gone by now; signToken()
+  // carries no x_id/google_id, so email + xHandle + ip is the complete
+  // reachable set (every account has a real email or an x_handle, and
+  // re-login is already blocked at both OAuth callbacks).
+  const banned = (() => {
+    const p = tokenPayload;
+    if (p) {
+      if (p.email && !/@x\.local$/i.test(p.email) && isBannedIdentity('email', p.email)) return `email:${p.email}`;
+      if (p.xHandle && isBannedIdentity('x_handle', p.xHandle)) return `x_handle:${p.xHandle}`;
+    }
+    // Admins are exempt from the IP check only - a mistyped ip in a ban
+    // body shouldn't be able to lock the operator out of their own site.
+    if (p?.isAdmin) return null;
+    const ip = realIpFromHandshake(socket.handshake);
+    if (ip && isBannedIdentity('ip', ip)) return `ip:${ip}`;
+    return null;
+  })();
+
+  if (banned) {
+    console.log(`[Socket] Rejected banned connection (${banned}).`);
+    const err = new Error('banned');
+    err.data = { code: 'ACCOUNT_BANNED' };
+    return next(err);
+  }
+
   next();
 });
 
@@ -829,17 +863,20 @@ app.post('/api/admin/ban', requireAuth, requireAdmin, (req, res) => {
   if (!user) return res.status(404).json({ error: 'No such user' });
   if (user.role === 'admin' || user.is_admin) return res.status(400).json({ error: 'Refusing to ban an admin account' });
 
-  let kicked = 0;
   const entry = presenceMap.get(user.id);
   // Captured while they're still connected - this is the only source for
   // it, since IPs are never logged anywhere else (see realIp()'s comment).
   // Once kicked, this is gone for good, so read it before disconnecting.
   const liveIps = entry ? [...entry.ips] : [];
-  if (entry) {
-    for (const socketId of entry.socketIds) {
-      const socket = io.sockets.sockets.get(socketId);
-      if (socket) { socket.disconnect(true); kicked++; }
-    }
+  // Snapshot rather than iterate live: entry.socketIds is mutated by the
+  // disconnect handler as each socket goes down.
+  const socketIds = entry ? [...entry.socketIds] : [];
+
+  // Tell them before cutting the wire. A bare disconnect is invisible to
+  // the client (socket.io just reconnects), which is why a banned viewer's
+  // video used to keep playing - the player never learns anything happened.
+  for (const socketId of socketIds) {
+    io.sockets.sockets.get(socketId)?.emit('account_banned');
   }
 
   const bannedIdentities = [];
@@ -858,8 +895,17 @@ app.post('/api/admin/ban', requireAuth, requireAdmin, (req, res) => {
 
   db.prepare('DELETE FROM users WHERE id = ?').run(user.id);
 
+  // Deferred so the 'account_banned' packet above clears the transport
+  // first. Not load-bearing - if it's missed, the handshake rejection in
+  // io.use() catches them on the reconnect attempt instead.
+  setTimeout(() => {
+    for (const socketId of socketIds) {
+      io.sockets.sockets.get(socketId)?.disconnect(true);
+    }
+  }, 750);
+
   console.log(`[Admin Ban] "${user.username}" (id ${user.id}) banned and deleted. Identities: ${bannedIdentities.join(', ') || 'none'}. Reason: ${reason || 'unspecified'}`);
-  res.json({ username: user.username, kicked, bannedIdentities, deleted: true });
+  res.json({ username: user.username, kicked: socketIds.length, bannedIdentities, deleted: true });
 });
 
 // ---------- Signed stream URLs ----------
