@@ -1188,6 +1188,17 @@ function deriveGoogleUsername(email) {
   return (email.split('@')[0].replace(/[^a-zA-Z0-9_]/g, '') || 'user');
 }
 
+// Restricted after a cluster of throwaway-domain (.shop/.store) Google
+// accounts correlated with a stream leaker - only gmail.com and the
+// company's own domain may sign in with Google. Checked on every
+// callback (not just new signups) so it also cuts off a would-be
+// email-match link onto an existing password/X account.
+const ALLOWED_GOOGLE_DOMAINS = ['gmail.com', 'afenixtechnologies.com'];
+function isAllowedGoogleDomain(email) {
+  const domain = String(email).split('@')[1]?.toLowerCase();
+  return ALLOWED_GOOGLE_DOMAINS.includes(domain);
+}
+
 app.get('/api/auth/google/start', (req, res) => {
   if (!process.env.GOOGLE_CLIENT_ID || !process.env.GOOGLE_REDIRECT_URI) {
     console.error('[Google Signup] GOOGLE_CLIENT_ID/GOOGLE_REDIRECT_URI not configured');
@@ -1286,6 +1297,11 @@ app.get('/api/auth/google/callback', async (req, res) => {
     const googleEmail = googleUser.email;
     const googleName = googleUser.name || googleEmail;
     const googlePfpUrl = normalizeGooglePfp(googleUser.picture);
+
+    if (!isAllowedGoogleDomain(googleEmail)) {
+      res.clearCookie('google_oauth');
+      return res.redirect('/login.html?g_error=domain');
+    }
 
     if (isBannedIdentity('google_id', googleId) || isBannedIdentity('email', googleEmail)) {
       res.clearCookie('google_oauth');
