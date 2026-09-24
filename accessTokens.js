@@ -105,40 +105,21 @@ function verifyAccessCookie(req) {
   }
 }
 
-// A real logged-in account (349+ of them, only 12 with an OAuth-minted
-// access_session) was being bounced to no-access.html even after a
-// successful password login, because only the X/Google callbacks ever
-// called mintAccessSession() - a live bug found in the same audit that
-// found the stream hotlinking hole. Login now IS the gate: any valid
-// streamflix_session (signed with the same JWT_SECRET as access_session,
-// see initAccessTokens below) passes, independent of the rotating link.
-// streamflix_session tokens carry no `type` field (see signToken in
-// server.js), unlike access_session - just needs to verify and decode.
-// Same gap that requireAuth (server.js) and the socket.io auth middleware
-// had until this session's account-existence fix: jwt.verify alone accepts
-// a token for an account that's since been deleted/banned. Without this
-// check here too, /live itself (and therefore the whole page, including
-// whatever signed stream URLs it goes on to fetch) stayed reachable for a
-// banned user's still-valid 30-day cookie.
-function verifyUserSession(req) {
-  const token = req.cookies && req.cookies.streamflix_session;
-  if (!token) return null;
-  try {
-    const payload = _jwt.verify(token, _jwtSecret);
-    if (!_db.prepare('SELECT id FROM users WHERE id = ?').get(payload.id)) return null;
-    return payload;
-  } catch {
-    return null;
-  }
-}
-
+// Being logged in (any method - Google, X, admin password) USED to be
+// enough on its own, independent of the rotating link (see git history for
+// the previous verifyUserSession-based OR check). Deliberately reversed:
+// no sign-in method may bypass the current link - a valid access_session,
+// obtained by redeeming today's rotating /access?token=, is now required
+// regardless of login state. mintAccessSession() (server.js) - which used
+// to hand OAuth logins a free 24h access_session - is removed for the same
+// reason; see its former call sites in the X/Google callbacks.
 function requireAccessSession(req, res, next) {
-  if (verifyAccessCookie(req) || verifyUserSession(req)) return next();
+  if (verifyAccessCookie(req)) return next();
   return res.status(200).sendFile(NO_ACCESS_PAGE);
 }
 
 function gateStream(req, res, next) {
-  if (verifyAccessCookie(req) || verifyUserSession(req)) return next();
+  if (verifyAccessCookie(req)) return next();
   return res.status(403).send('Forbidden: valid access session required.');
 }
 

@@ -283,7 +283,8 @@ try {
 db.exec(`CREATE INDEX IF NOT EXISTS idx_polls_status ON polls(status)`);
 
 // ---------- Access-token system ----------
-// Registers /access, /admin/current-link, and starts the 18h rotation.
+// Registers /access, /admin/current-link, and starts the daily rotation
+// (every 24h at 23:30 UTC = 05:00 IST).
 // Uses the same db, jwt, JWT_SECRET, and IS_PROD already established above.
 initAccessTokens(
   db,
@@ -383,50 +384,122 @@ function sweepTitleSchedule() {
   }
 }
 
-// Polls OvenMediaEngine directly (mirrors what cf_purge_on_start.sh already
-// does for the Cloudflare purge-on-start job) so the backend knows stream
-// liveness without a new webhook or shared secret. Used here to reset the
-// title the moment a stream ends; fails closed on any error so a transient
-// OME API blip is never mistaken for the stream actually ending.
+// Polls OvenMediaEngine directly so the backend knows stream liveness
+// without a webhook. Fails closed on any error so a transient OME API blip
+// is never mistaken for the stream ending (or a new one starting).
 const OME_API_URL = 'http://127.0.0.1:8081/v1/vhosts/default/apps/app/streams';
+const STREAM_POLL_INTERVAL_MS = 2000;
+
+// OME names segments seg_<track>_<seq>_..._<fixed id>_llhls.m4s and resets
+// <seq> to 0 on every new publish, so each stream reuses the previous one's
+// URLs. Cloudflare must be purged per SESSION, not per offline->live flip:
+// OBS reconnects in as little as 7-9s, faster than any flip-sampling poll
+// can see (the old once-a-minute cron missed them and served stale video).
+// OME's createdTime changes on every publish, so it identifies the session
+// even when the gap between two streams is shorter than the poll interval.
+// Purging at stream END doesn't work either: between streams OME keeps
+// serving the previous session's DVR files, so stuck players would refill
+// the edge before the next start. After createdTime changes, OME has wiped
+// them, and the first new segment is still ~6s away - that's the window.
+let streamState = { live: null, sessionId: null };
+
+function readSetting(key) {
+  const row = db.prepare('SELECT value FROM settings WHERE key = ?').get(key);
+  return row ? row.value : null;
+}
+
+function writeSetting(key, value) {
+  db.prepare(`
+    INSERT INTO settings (key, value) VALUES (?, ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+  `).run(key, value);
+}
+
+async function omeApiGet(url) {
+  const authHeader = 'Basic ' + Buffer.from(process.env.OME_API_ACCESS_TOKEN, 'utf8').toString('base64');
+  const res = await fetch(url, {
+    headers: { Authorization: authHeader },
+    signal: AbortSignal.timeout(5000)
+  });
+  if (!res.ok) throw new Error(`OME API returned ${res.status} for ${url}`);
+  return res.json();
+}
+
+async function purgeCloudflareCache() {
+  const zoneId = process.env.CLOUDFLARE_ZONE_ID;
+  const apiToken = process.env.CLOUDFLARE_API_TOKEN;
+  if (!zoneId || !apiToken) {
+    console.error('[Stream] Cloudflare purge skipped: CLOUDFLARE_ZONE_ID / CLOUDFLARE_API_TOKEN not set');
+    return false;
+  }
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const res = await fetch(`https://api.cloudflare.com/client/v4/zones/${zoneId}/purge_cache`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${apiToken}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ purge_everything: true }),
+        signal: AbortSignal.timeout(10000)
+      });
+      const json = await res.json().catch(() => ({}));
+      if (json.success) return true;
+      console.error(`[Stream] Cloudflare purge attempt ${attempt} failed (HTTP ${res.status}):`, JSON.stringify(json.errors || null));
+    } catch (err) {
+      console.error(`[Stream] Cloudflare purge attempt ${attempt} error:`, err.message || err);
+    }
+  }
+  return false;
+}
+
+let streamPollInFlight = false;
 
 async function pollStreamLive() {
+  if (streamPollInFlight) return;
+  streamPollInFlight = true;
   try {
-    const token = process.env.OME_API_ACCESS_TOKEN;
-    if (!token) return; // not configured - skip silently, nothing to poll
-    const authHeader = 'Basic ' + Buffer.from(token, 'utf8').toString('base64');
-    const res = await fetch(OME_API_URL, {
-      headers: { Authorization: authHeader },
-      signal: AbortSignal.timeout(5000)
-    });
-    if (!res.ok) throw new Error(`OME API returned ${res.status}`);
-    const json = await res.json();
-    const live = Array.isArray(json.response) && json.response.length > 0;
-    const computedState = live ? 'live' : 'offline';
+    if (!process.env.OME_API_ACCESS_TOKEN) return; // not configured - nothing to poll
+    const list = await omeApiGet(OME_API_URL);
+    const live = Array.isArray(list.response) && list.response.length > 0;
 
-    const row = db.prepare(`SELECT value FROM settings WHERE key = 'stream_live_state'`).get();
-    const persisted = row ? row.value : null;
-    if (computedState === persisted) return;
-
-    db.prepare(`
-      INSERT INTO settings (key, value) VALUES ('stream_live_state', ?)
-      ON CONFLICT(key) DO UPDATE SET value = excluded.value
-    `).run(computedState);
-
-    if (persisted === 'live' && computedState === 'offline') {
-      applyTitle(TITLE_DEFAULT, 'stream ended');
+    let sessionId = null;
+    if (live) {
+      const detail = await omeApiGet(`${OME_API_URL}/stream`);
+      sessionId = detail?.response?.input?.createdTime || null;
+      if (!sessionId) throw new Error('OME stream detail has no input.createdTime');
     }
+
+    // Persisted, so a backend restart doesn't re-purge a stream that was
+    // already purged - but does purge one that started while it was down.
+    if (live && sessionId !== readSetting('stream_session_id')) {
+      writeSetting('stream_session_id', sessionId);
+      const ok = await purgeCloudflareCache();
+      console.log(`[Stream] New session ${sessionId} - Cloudflare purge ${ok ? 'ok' : 'FAILED'}`);
+    }
+
+    const computedState = live ? 'live' : 'offline';
+    const persistedState = readSetting('stream_live_state');
+    if (computedState !== persistedState) {
+      writeSetting('stream_live_state', computedState);
+      if (persistedState === 'live' && computedState === 'offline') {
+        applyTitle(TITLE_DEFAULT, 'stream ended');
+      }
+    }
+
+    // Emitted only after the purge above has finished, so players rebuilding
+    // for a new session can't fetch anything the purge was meant to clear.
+    const changed = streamState.live !== live || streamState.sessionId !== sessionId;
+    streamState = { live, sessionId };
+    if (changed) io.emit('stream_state', streamState);
   } catch (err) {
-    // Fail closed: log and leave persisted state untouched so a network blip
-    // is never treated as the stream ending.
     console.error('[Stream Live Poll Error]:', err.message || err);
+  } finally {
+    streamPollInFlight = false;
   }
 }
 
 sweepTitleSchedule();
 pollStreamLive();
 setInterval(sweepTitleSchedule, 60 * 1000);
-setInterval(pollStreamLive, 60 * 1000);
+setInterval(pollStreamLive, STREAM_POLL_INTERVAL_MS);
 
 // ---------- Helpers ----------
 const RESERVED_USERNAMES = ['admin', 'administrator', 'moderator', 'system', 'root', 'support'];
@@ -467,7 +540,7 @@ function requireAuth(req, res, next) {
   if (!token && req.headers.authorization && req.headers.authorization.startsWith('Bearer ')) {
     token = req.headers.authorization.split(' ')[1];
   }
-  if (!token) return res.status(401).json({ error: 'Not logged in' });
+  if (!token) return res.status(401).json({ error: 'Not logged in', code: 'SESSION_EXPIRED' });
   try {
     const payload = jwt.verify(token, JWT_SECRET);
     // Same fix as the Socket.IO auth middleware, same reason: a valid JWT
@@ -476,12 +549,19 @@ function requireAuth(req, res, next) {
     // the row behind them. One indexed primary-key lookup per authenticated
     // request; negligible next to everything else already per-request here.
     if (!db.prepare('SELECT id FROM users WHERE id = ?').get(payload.id)) {
-      return res.status(401).json({ error: 'Account no longer exists' });
+      // The client shows "Account suspended" only for ACCOUNT_BANNED - an
+      // account deleted without a ban, like any other dead session, just
+      // gets asked to sign in again. Same identities as the socket check.
+      const banned = (payload.email && !/@x\.local$/i.test(payload.email) && isBannedIdentity('email', payload.email))
+        || (payload.xHandle && isBannedIdentity('x_handle', payload.xHandle));
+      return banned
+        ? res.status(401).json({ error: 'Account suspended', code: 'ACCOUNT_BANNED' })
+        : res.status(401).json({ error: 'Account no longer exists', code: 'SESSION_EXPIRED' });
     }
     req.user = payload;
     next();
   } catch {
-    res.status(401).json({ error: 'Invalid or expired session' });
+    res.status(401).json({ error: 'Invalid or expired session', code: 'SESSION_EXPIRED' });
   }
 }
 
@@ -619,6 +699,11 @@ io.on('connection', (socket) => {
     ids.add(socket.id);
   }
   broadcastViewerCount();
+
+  // A (re)connecting player may have missed restarts while its socket was
+  // down (backgrounded tab, network drop) - it compares this sessionId with
+  // the one it's playing and rebuilds if they differ.
+  if (streamState.live !== null) socket.emit('stream_state', streamState);
 
   socket.on('disconnect', () => {
     if (presenceUserId) {
@@ -960,10 +1045,15 @@ const STREAM_QUALITY_PATHS = {
 // only gates when a NEW request can start, not sessions already playing.
 const STREAM_URL_TTL_MS = 12 * 60 * 60 * 1000;
 
-// requireAuth is the actual access-control fix: without a valid session,
-// there is no way to obtain a working stream URL at all anymore, closing
-// the hole the audit found regardless of what the rotating link gate does.
-app.get('/api/stream/urls', requireAuth, (req, res) => {
+// requireAuth closes the original hotlinking hole (no account, no URL).
+// gateStream is layered on top so the current rotating link is required
+// here too - otherwise a logged-in-but-linkless user could still get a
+// working signed URL straight from this API, bypassing the point of gating
+// '/' and '/live' on the link in the first place. gateStream (not
+// requireAccessSession) because this is a JSON endpoint - requireAccessSession
+// sends the no-access HTML page with a 200, which loadStreamUrls()'s
+// `!res.ok` check wouldn't catch, only a confusing res.json() parse failure.
+app.get('/api/stream/urls', requireAuth, gateStream, (req, res) => {
   if (!process.env.OME_SIGNED_POLICY_KEY) {
     console.error('[Stream URLs] OME_SIGNED_POLICY_KEY not configured');
     return res.status(503).json({ error: 'Stream signing is not configured' });
@@ -1001,26 +1091,6 @@ function normalizeXPfp(url) {
   return url.replace('_normal.', '_bigger.');
 }
 
-// The site sits behind an invite-link gate (requireAccessSession, only
-// applied to '/', '/index.html', '/live', '/live/index.html' - see the top
-// of this file). A freshly OAuth-authed user has no access_session cookie
-// yet, so without this they'd be redirected straight into no-access.html
-// despite having just proven who they are. Mirrors the cookie
-// accessTokens.js's /access route sets (registerAccessRoute), but OAuth
-// sign-in (X or Google) is an independent, permanent door into the site
-// (nothing gates either callback route - see /api/auth/x/callback and
-// /api/auth/google/callback below), so it mints its own 24h session rather
-// than depending on the shared rotating invite token.
-function mintAccessSession(res) {
-  const sessionJwt = jwt.sign({ type: 'access_session' }, JWT_SECRET, { expiresIn: '24h' });
-  res.cookie('access_session', sessionJwt, {
-    httpOnly: true,
-    secure: IS_PROD,
-    path: '/',
-    sameSite: 'lax',
-    maxAge: 24 * 60 * 60 * 1000
-  });
-}
 
 app.get('/api/auth/x/start', (req, res) => {
   if (!process.env.X_CLIENT_ID || !process.env.X_REDIRECT_URI) {
@@ -1195,7 +1265,6 @@ app.get('/api/auth/x/callback', async (req, res) => {
 
     const token = signToken(result.user);
     setAuthCookie(res, token);
-    mintAccessSession(res);
 
     console.log(`[X Signup] ${result.outcome === 'signup' ? 'New' : 'Returning'} X user @${xHandle} (verified=${!!xVerified}) logged in.`);
     return res.redirect('/live');
@@ -1413,7 +1482,6 @@ app.get('/api/auth/google/callback', async (req, res) => {
 
     const token = signToken(result.user);
     setAuthCookie(res, token);
-    mintAccessSession(res);
 
     console.log(`[Google Signup] ${result.outcome} for ${googleEmail} (user id ${result.user.id}).`);
     return res.redirect('/live');
@@ -1480,7 +1548,6 @@ app.post('/api/auth/google/complete', (req, res) => {
     const user = db.prepare('SELECT * FROM users WHERE id = ?').get(info.lastInsertRowid);
     const token = signToken(user);
     setAuthCookie(res, token);
-    mintAccessSession(res);
     res.clearCookie('google_pending');
     console.log(`[Google Signup] New account "${cleanUsername}" completed for ${payload.googleEmail} (avatar=${useAvatar}).`);
     res.json({ success: true, redirect: '/live' });
@@ -1883,6 +1950,49 @@ app.delete('/api/polls/:id', requireAuth, requireAdmin, (req, res) => {
   } catch (err) {
     console.error('Delete poll error:', err);
     res.status(500).json({ error: 'Failed to delete poll' });
+  }
+});
+
+// POST /api/polls/:id/end — admin cuts an open poll short RIGHT NOW: declares
+// final results to everyone currently watching (the same poll_closed shape
+// sweepPolls() sends at the normal 12h mark), then deletes it outright
+// instead of leaving it sitting in the results tab for the usual 8h window.
+// Distinct from DELETE /api/polls/:id below, which sends {deleted:true} and
+// makes the poll just vanish with no results shown at all - that route is
+// for "this poll was a mistake", this one is for "call it now".
+app.post('/api/polls/:id/end', requireAuth, requireAdmin, (req, res) => {
+  try {
+    const pollId = Number(req.params.id);
+    const poll = db.prepare('SELECT status FROM polls WHERE id = ?').get(pollId);
+    if (!poll) return res.status(404).json({ error: 'Poll not found' });
+    if (poll.status !== 'open') return res.status(409).json({ error: 'This poll is already closed' });
+
+    // Read while the votes/options rows still exist - buildPollPayload joins
+    // against them, so it must run before the delete below.
+    const finalPayload = buildPollPayload(pollId, null);
+    finalPayload.status = 'closed';
+    finalPayload.closed_at = new Date().toISOString();
+
+    const removePoll = db.transaction(() => {
+      db.prepare('DELETE FROM poll_votes WHERE poll_id = ?').run(pollId);
+      db.prepare('DELETE FROM poll_options WHERE poll_id = ?').run(pollId);
+      return db.prepare('DELETE FROM polls WHERE id = ?').run(pollId);
+    });
+    removePoll();
+
+    // No {deleted:true} - the frontend's poll_closed handler only removes
+    // the card on that flag, otherwise it renders status:'closed' as final
+    // results (renderPollCard's isClosed branch), which is what we want
+    // here: results stay visible on already-open tabs even though the DB
+    // row is already gone. A fresh page load won't see it (not in history -
+    // the row is deleted, not just status-flipped), which is the "delete"
+    // half of what this route promises.
+    io.emit('poll_closed', finalPayload);
+
+    res.json({ success: true, poll: finalPayload });
+  } catch (err) {
+    console.error('End poll error:', err);
+    res.status(500).json({ error: 'Failed to end poll' });
   }
 });
 
