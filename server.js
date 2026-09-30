@@ -16,11 +16,32 @@ const crypto = require('crypto');
 const { initAccessTokens, requireAccessSession, gateStream } = require('./accessTokens');
 const rateLimit = require('express-rate-limit');
 
+// ---------- Channels ----------
+// The site runs two streams side by side: "live" (biggboss24hrs.com, OME
+// application "app") and "episode" (episode.biggboss24hrs.com, OME application
+// "episode"). Both hostnames reach this one backend and serve the same page
+// code, so the channel is decided by which hostname the request arrived on -
+// that way the episode page can call the exact same API paths as /live and
+// automatically get its own stream, title, chat and polls.
+const SITE_ORIGIN = process.env.SITE_ORIGIN || 'https://biggboss24hrs.com';
+const EPISODE_HOST = 'episode.biggboss24hrs.com';
+const EPISODE_ORIGIN = `https://${EPISODE_HOST}`;
+const COOKIE_DOMAIN = '.biggboss24hrs.com'; // shared by both hostnames, only ever used in production
+const CHANNELS = ['live', 'episode'];
+const CHANNEL_OME_APP = { live: 'app', episode: 'episode' };
+
+function channelFromHost(host) {
+  return String(host || '').toLowerCase().split(':')[0] === EPISODE_HOST ? 'episode' : 'live';
+}
+function channelOf(req) { return channelFromHost(req.headers.host); }
+function channelOfSocket(socket) { return channelFromHost(socket.handshake.headers.host); }
+function roomOf(channel) { return `ch:${channel}`; }
+
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: process.env.SITE_ORIGIN || 'https://biggboss24hrs.com',
+    origin: [SITE_ORIGIN, EPISODE_ORIGIN],
     credentials: true
   }
 });
@@ -37,7 +58,7 @@ app.set('trust proxy', 1); // Trust Nginx for X-Forwarded-Proto
 app.use(express.json());
 app.use(cookieParser());
 app.use(cors({
-  origin: process.env.SITE_ORIGIN || 'https://biggboss24hrs.com',
+  origin: [SITE_ORIGIN, EPISODE_ORIGIN],
   credentials: true
 }));
 
@@ -91,6 +112,18 @@ const loginLimiter = makeLimiter(15 * 60 * 1000, 10, 'Too many login attempts. P
 // These intercept requests for the homepage and live page and enforce the
 // access_session cookie. Static assets (CSS, JS, images) are still served
 // ungated by express.static below so no-access.html can load its own assets.
+// episode.biggboss24hrs.com IS the episode page - its root serves that page
+// instead of the home page, behind the same rotating access link as /live.
+app.get(['/', '/index.html'], (req, res, next) => {
+  if (channelOf(req) !== 'episode') return next();
+  if (!EPISODE_REQUIRES_ACCESS_LINK) return servedEpisode();
+  return requireAccessSession(req, res, servedEpisode);
+  function servedEpisode() {
+    res.set('Cache-Control', 'no-store');
+    res.sendFile('/var/www/streamflix/episode/index.html');
+  }
+});
+
 app.get(['/', '/index.html'], requireAccessSession, (req, res) => {
   res.sendFile('/var/www/streamflix/index.html');
 });
@@ -282,6 +315,12 @@ try {
 } catch (e) {}
 db.exec(`CREATE INDEX IF NOT EXISTS idx_polls_status ON polls(status)`);
 
+// Per-channel chat and polls: every row belongs to exactly one page. Existing
+// rows predate the episode page, so the DEFAULT 'live' assigns them correctly.
+try { db.exec(`ALTER TABLE chat_messages ADD COLUMN channel TEXT NOT NULL DEFAULT 'live'`); } catch (e) {}
+try { db.exec(`ALTER TABLE polls ADD COLUMN channel TEXT NOT NULL DEFAULT 'live'`); } catch (e) {}
+db.exec(`CREATE INDEX IF NOT EXISTS idx_chat_channel ON chat_messages(channel, id)`);
+
 // ---------- Access-token system ----------
 // Registers /access, /admin/current-link, and starts the daily rotation
 // (every 24h at 23:30 UTC = 05:00 IST).
@@ -314,80 +353,35 @@ function cleanupOldMessages() {
 cleanupOldMessages();
 setInterval(cleanupOldMessages, 60 * 60 * 1000);
 
-// ---------- Auto title schedule ----------
-// The channel name auto-switches for the nightly episode window, and resets
-// the moment a live stream ends. IST has no DST and is a fixed UTC+5:30, so
-// shifting the epoch and reading the UTC getters is safe with no date library
-// (accessTokens.js's getMsUntilNext1130PMUTC does the same kind of manual math).
-const TITLE_DEFAULT = '24Hrs Channel';
-const TITLE_EPISODE = 'Bigg Boss 20 Episode';
-const TITLE_WKW = 'Bigg Boss WKW';
-const TITLE_WINDOW_START_MIN = 21 * 60;       // 21:00 IST
-const TITLE_WINDOW_END_MIN = 22 * 60 + 30;    // 22:30 IST
+// ---------- Stream titles ----------
+// Titles are fully manual now (the old auto-switching schedule, and the reset
+// to the default when a stream ended, were removed on purpose): an admin edits
+// the title inline on the page it belongs to, and it stays until edited again.
+// Each channel keeps its own title.
+const TITLE_DEFAULTS = { live: '24Hrs Channel', episode: 'Episode' };
 
-function scheduledTitleState(now = new Date()) {
-  const ist = new Date(now.getTime() + 5.5 * 3600 * 1000);
-  const mins = ist.getUTCHours() * 60 + ist.getUTCMinutes();
-  if (mins < TITLE_WINDOW_START_MIN || mins >= TITLE_WINDOW_END_MIN) return 'default';
-  const day = ist.getUTCDay(); // 0 Sun ... 6 Sat
-  return (day === 0 || day === 6) ? 'wkw' : 'episode';
+function titleKey(channel) {
+  return channel === 'episode' ? 'stream_title:episode' : 'stream_title';
 }
 
-function titleForState(state) {
-  if (state === 'episode') return TITLE_EPISODE;
-  if (state === 'wkw') return TITLE_WKW;
-  return TITLE_DEFAULT;
+function getTitle(channel) {
+  const row = db.prepare('SELECT value FROM settings WHERE key = ?').get(titleKey(channel));
+  return row ? row.value : TITLE_DEFAULTS[channel];
 }
 
-// Shared by the schedule sweep and the stream-liveness sweep below. Only
-// writes/emits when the title actually changes, matching the "log only when
-// something changed" house pattern from cleanupOldMessages().
-function applyTitle(newTitle, reason) {
-  const row = db.prepare(`SELECT value FROM settings WHERE key = 'stream_title'`).get();
-  if (row && row.value === newTitle) return false;
-  db.prepare(`
-    INSERT INTO settings (key, value) VALUES ('stream_title', ?)
-    ON CONFLICT(key) DO UPDATE SET value = excluded.value
-  `).run(newTitle);
-  if (typeof io !== 'undefined') {
-    io.emit('stream_title_updated', { title: newTitle });
-  }
-  console.log(`[Title] -> "${newTitle}" (${reason})`);
-  return true;
-}
-
-// Seed the default title if none is set yet (first boot).
-const existingTitle = db.prepare(`SELECT value FROM settings WHERE key = 'stream_title'`).get();
-if (!existingTitle) {
-  applyTitle(TITLE_DEFAULT, 'initial seed');
-}
-
-// Reconciles the persisted schedule state against the computed one every
-// minute rather than firing on a cron edge, so a missed tick or a restart
-// self-heals instead of losing the boundary. Only acts at a boundary - a
-// manual title set by an admin, or a stream-end reset, survives untouched
-// between boundaries because nothing here writes unless the state changed.
-function sweepTitleSchedule() {
-  try {
-    const computed = scheduledTitleState();
-    const row = db.prepare(`SELECT value FROM settings WHERE key = 'title_schedule_state'`).get();
-    const persisted = row ? row.value : null;
-    if (computed === persisted) return;
-
-    db.prepare(`
-      INSERT INTO settings (key, value) VALUES ('title_schedule_state', ?)
-      ON CONFLICT(key) DO UPDATE SET value = excluded.value
-    `).run(computed);
-    applyTitle(titleForState(computed), `schedule -> ${computed}`);
-  } catch (err) {
-    console.error('[Title Schedule Error]:', err);
+// Seed each channel's default title if none is set yet (first boot).
+for (const ch of CHANNELS) {
+  if (!db.prepare('SELECT 1 FROM settings WHERE key = ?').get(titleKey(ch))) {
+    db.prepare('INSERT INTO settings (key, value) VALUES (?, ?)').run(titleKey(ch), TITLE_DEFAULTS[ch]);
   }
 }
 
 // Polls OvenMediaEngine directly so the backend knows stream liveness
 // without a webhook. Fails closed on any error so a transient OME API blip
-// is never mistaken for the stream ending (or a new one starting).
-const OME_API_URL = 'http://127.0.0.1:8081/v1/vhosts/default/apps/app/streams';
+// is never mistaken for the stream ending (or a new one starting). Each
+// channel is polled independently - an error on one (e.g. its OME
+// application not loaded) must never stop the other.
+const OME_APPS_URL = 'http://127.0.0.1:8081/v1/vhosts/default/apps';
 const STREAM_POLL_INTERVAL_MS = 2000;
 
 // OME names segments seg_<track>_<seq>_..._<fixed id>_llhls.m4s and resets
@@ -401,7 +395,14 @@ const STREAM_POLL_INTERVAL_MS = 2000;
 // serving the previous session's DVR files, so stuck players would refill
 // the edge before the next start. After createdTime changes, OME has wiped
 // them, and the first new segment is still ~6s away - that's the window.
-let streamState = { live: null, sessionId: null };
+const streamStates = {
+  live: { live: null, sessionId: null, priority: false },
+  episode: { live: null, sessionId: null, priority: false }
+};
+
+function sessionSettingKey(channel) {
+  return channel === 'episode' ? 'stream_session_id:episode' : 'stream_session_id';
+}
 
 function readSetting(key) {
   const row = db.prepare('SELECT value FROM settings WHERE key = ?').get(key);
@@ -423,6 +424,17 @@ async function omeApiGet(url) {
   });
   if (!res.ok) throw new Error(`OME API returned ${res.status} for ${url}`);
   return res.json();
+}
+
+async function omeApiDelete(url) {
+  const authHeader = 'Basic ' + Buffer.from(process.env.OME_API_ACCESS_TOKEN, 'utf8').toString('base64');
+  const res = await fetch(url, {
+    method: 'DELETE',
+    headers: { Authorization: authHeader },
+    signal: AbortSignal.timeout(5000)
+  });
+  if (!res.ok) throw new Error(`OME API returned ${res.status} for DELETE ${url}`);
+  return res.json().catch(() => ({}));
 }
 
 async function purgeCloudflareCache() {
@@ -450,6 +462,91 @@ async function purgeCloudflareCache() {
   return false;
 }
 
+// One channel's current OME state. Throws on any OME error so the caller
+// leaves that channel's last known state untouched.
+async function readChannelStream(channel) {
+  const base = `${OME_APPS_URL}/${CHANNEL_OME_APP[channel]}/streams`;
+  const list = await omeApiGet(base);
+  const live = Array.isArray(list.response) && list.response.length > 0;
+  let sessionId = null;
+  // The API lists INPUT names (the ingest key); the playback name is pinned
+  // to "stream" in Server.xml, so "/stream" below is the output's detail.
+  const inputName = live ? list.response[0] : null;
+  if (live) {
+    const detail = await omeApiGet(`${base}/stream`);
+    sessionId = detail?.response?.input?.createdTime || null;
+    if (!sessionId) throw new Error('OME stream detail has no input.createdTime');
+  }
+  return { live, sessionId, inputName };
+}
+
+// ---------- Episode priority mode ----------
+// The server can only transcode ONE full set of qualities at a time (~180% of
+// its 400% CPU each). The episode always gets the full ladder. While the
+// episode is on air, /live is produced in 1080p-only (a passthrough: ~no CPU)
+// and gets its full ladder back once the episode has been off for a while.
+// OME decides a stream's qualities when the stream STARTS, by asking the
+// transcode webhook below, so a mode change on an already-running /live
+// stream is done by briefly disconnecting its OBS input - OBS reconnects on
+// its own and the new session starts in the right mode.
+const PRIORITY_IDLE_MS = 3 * 60 * 1000;            // episode must be off this long before live gets its ladder back
+const PRIORITY_SWITCH_COOLDOWN_MS = 2 * 60 * 1000; // never disconnect live more than once per this window
+const PRIORITY_MAX_FAILED_SWITCHES = 2;            // give up (and log) instead of flapping if a switch doesn't take
+let episodeOfflineSince = null;
+let lastPrioritySwitchAt = 0;
+let failedPrioritySwitches = 0;
+
+function priorityOn() { return readSetting('priority_mode') === '1'; }
+// The mode the CURRENT live session was started in ('full' | 'priority'),
+// recorded by the webhook when OME asks how to build it.
+function liveRunMode() { return readSetting('live_run_mode') === 'priority' ? 'priority' : 'full'; }
+
+// Which quality playlists actually exist right now for a channel.
+function availableQualityKeys(channel) {
+  const all = Object.keys(STREAM_QUALITY_FILES);
+  if (channel === 'episode') return all;
+  const mode = streamStates.live.live ? liveRunMode() : (priorityOn() ? 'priority' : 'full');
+  return mode === 'priority' ? ['auto', 'q1080'] : all;
+}
+
+function updatePriorityFlag(episode) {
+  if (!episode) return; // episode poll failed - leave the flag as it was
+  if (episode.live) {
+    episodeOfflineSince = null;
+    if (!priorityOn()) {
+      writeSetting('priority_mode', '1');
+      console.log('[Priority] Episode is live - /live switches to 1080p-only.');
+    }
+  } else if (priorityOn()) {
+    if (episodeOfflineSince === null) episodeOfflineSince = Date.now();
+    else if (Date.now() - episodeOfflineSince >= PRIORITY_IDLE_MS) {
+      writeSetting('priority_mode', '0');
+      episodeOfflineSince = null;
+      console.log('[Priority] Episode has been off for 3 min - /live gets its full ladder back.');
+    }
+  }
+}
+
+async function reconcileLiveMode(liveRes) {
+  // Only once the webhook has proven itself (OME called it at least once):
+  // without it, a disconnect could never change the mode and would just
+  // knock /live offline for nothing.
+  if (readSetting('webhook_seen') !== '1') return;
+  if (!liveRes || !liveRes.live || !liveRes.inputName) { failedPrioritySwitches = 0; return; }
+  const want = priorityOn() ? 'priority' : 'full';
+  if (liveRunMode() === want) { failedPrioritySwitches = 0; return; }
+  if (Date.now() - lastPrioritySwitchAt < PRIORITY_SWITCH_COOLDOWN_MS) return;
+  if (failedPrioritySwitches >= PRIORITY_MAX_FAILED_SWITCHES) return;
+  lastPrioritySwitchAt = Date.now();
+  failedPrioritySwitches++;
+  try {
+    await omeApiDelete(`${OME_APPS_URL}/app/streams/${encodeURIComponent(liveRes.inputName)}`);
+    console.log(`[Priority] Disconnected the live input so it restarts in "${want}" mode (was "${liveRunMode()}").`);
+  } catch (err) {
+    console.error('[Priority] Could not disconnect the live input:', err.message || err);
+  }
+}
+
 let streamPollInFlight = false;
 
 async function pollStreamLive() {
@@ -457,38 +554,50 @@ async function pollStreamLive() {
   streamPollInFlight = true;
   try {
     if (!process.env.OME_API_ACCESS_TOKEN) return; // not configured - nothing to poll
-    const list = await omeApiGet(OME_API_URL);
-    const live = Array.isArray(list.response) && list.response.length > 0;
 
-    let sessionId = null;
-    if (live) {
-      const detail = await omeApiGet(`${OME_API_URL}/stream`);
-      sessionId = detail?.response?.input?.createdTime || null;
-      if (!sessionId) throw new Error('OME stream detail has no input.createdTime');
-    }
-
-    // Persisted, so a backend restart doesn't re-purge a stream that was
-    // already purged - but does purge one that started while it was down.
-    if (live && sessionId !== readSetting('stream_session_id')) {
-      writeSetting('stream_session_id', sessionId);
-      const ok = await purgeCloudflareCache();
-      console.log(`[Stream] New session ${sessionId} - Cloudflare purge ${ok ? 'ok' : 'FAILED'}`);
-    }
-
-    const computedState = live ? 'live' : 'offline';
-    const persistedState = readSetting('stream_live_state');
-    if (computedState !== persistedState) {
-      writeSetting('stream_live_state', computedState);
-      if (persistedState === 'live' && computedState === 'offline') {
-        applyTitle(TITLE_DEFAULT, 'stream ended');
+    const results = {};
+    await Promise.all(CHANNELS.map(async (ch) => {
+      try {
+        results[ch] = await readChannelStream(ch);
+      } catch (err) {
+        console.error(`[Stream Live Poll Error] ${ch}:`, err.message || err);
       }
+    }));
+
+    updatePriorityFlag(results.episode);
+    await reconcileLiveMode(results.live);
+
+    // A new session on EITHER channel needs one purge. Session ids are
+    // persisted, so a backend restart doesn't re-purge a stream that was
+    // already purged - but does purge one that started while it was down.
+    let needsPurge = false;
+    for (const ch of CHANNELS) {
+      const r = results[ch];
+      if (r && r.live && r.sessionId !== readSetting(sessionSettingKey(ch))) {
+        writeSetting(sessionSettingKey(ch), r.sessionId);
+        needsPurge = true;
+        console.log(`[Stream] New ${ch} session ${r.sessionId}`);
+      }
+    }
+    if (needsPurge) {
+      const ok = await purgeCloudflareCache();
+      console.log(`[Stream] Cloudflare purge ${ok ? 'ok' : 'FAILED'}`);
     }
 
     // Emitted only after the purge above has finished, so players rebuilding
     // for a new session can't fetch anything the purge was meant to clear.
-    const changed = streamState.live !== live || streamState.sessionId !== sessionId;
-    streamState = { live, sessionId };
-    if (changed) io.emit('stream_state', streamState);
+    // Each channel's state goes only to that channel's viewers.
+    for (const ch of CHANNELS) {
+      const r = results[ch];
+      if (!r) continue;
+      const prev = streamStates[ch];
+      // Live viewers also learn whether the episode currently has priority,
+      // so their page can explain the 1080p-only mode.
+      const priority = ch === 'live' ? priorityOn() : false;
+      const changed = prev.live !== r.live || prev.sessionId !== r.sessionId || prev.priority !== priority;
+      streamStates[ch] = { live: r.live, sessionId: r.sessionId, priority };
+      if (changed) io.to(roomOf(ch)).emit('stream_state', streamStates[ch]);
+    }
   } catch (err) {
     console.error('[Stream Live Poll Error]:', err.message || err);
   } finally {
@@ -496,10 +605,87 @@ async function pollStreamLive() {
   }
 }
 
-sweepTitleSchedule();
 pollStreamLive();
-setInterval(sweepTitleSchedule, 60 * 1000);
 setInterval(pollStreamLive, STREAM_POLL_INTERVAL_MS);
+
+// ---------- OME transcode webhook ----------
+// OME calls this when a stream STARTS, asking which output profiles to build.
+// The OME container sits on Docker's bridge network, where "127.0.0.1" is the
+// container itself - so this listener binds to the bridge gateway address
+// (172.17.0.1, reachable only from this machine and its containers, never
+// from the internet), separate from the public app on 127.0.0.1:4000.
+//   episode          -> answer "allowed: false" = OME builds its own local
+//                       profiles from Server.xml (the full ladder).
+//   live, normal     -> same.
+//   live, priority   -> a 1080p-only profile (bypass, near-zero CPU).
+// Anything going wrong (this listener down, slow, or erroring) makes OME fall
+// back to its local full ladder (UseLocalProfilesOn* in Server.xml), so a
+// stream can never fail to start because of the webhook.
+const WEBHOOK_BIND = process.env.OME_WEBHOOK_BIND || '172.17.0.1';
+const WEBHOOK_PORT = Number(process.env.OME_WEBHOOK_PORT || 4001);
+const WEBHOOK_SECRET = process.env.OME_WEBHOOK_SECRET || '';
+let webhookRequestsLogged = 0;
+
+function buildPriorityProfiles() {
+  return {
+    outputProfile: [{
+      name: 'bypass_stream',
+      outputStreamName: 'stream',
+      encodes: {
+        videos: [{ name: 'bypass_video', bypass: true }],
+        audios: [{ name: 'aac_audio', codec: 'aac', bitrate: 128000, samplerate: 48000, channel: 2, bypassIfMatch: { codec: 'eq' } }]
+      },
+      playlists: [
+        { name: 'default', fileName: 'llhls', options: { hlsChunklistPathDepth: 0, enableTsPackaging: true },
+          renditions: [{ name: '1080p', video: 'bypass_video', audio: 'aac_audio' }] },
+        { name: '1080p only', fileName: 'q1080', options: { enableTsPackaging: true },
+          renditions: [{ name: 'q1080', video: 'bypass_video', audio: 'aac_audio' }] }
+      ]
+    }]
+  };
+}
+
+const webhookApp = express();
+webhookApp.post('/internal/ome/transcode', express.raw({ type: '*/*', limit: '256kb' }), (req, res) => {
+  try {
+    const raw = req.body instanceof Buffer ? req.body : Buffer.from('');
+    if (WEBHOOK_SECRET) {
+      const expected = crypto.createHmac('sha1', WEBHOOK_SECRET).update(raw).digest('base64url');
+      const got = String(req.headers['x-ome-signature'] || '');
+      const a = Buffer.from(expected), b = Buffer.from(got);
+      if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+        console.error('[Webhook] Rejected a transcode request with a bad signature.');
+        return res.status(401).json({ allowed: false, reason: 'bad signature' });
+      }
+    }
+    const body = JSON.parse(raw.toString('utf8') || '{}');
+    if (webhookRequestsLogged < 6) {
+      webhookRequestsLogged++;
+      console.log('[Webhook] request:', raw.toString('utf8').slice(0, 1200));
+    }
+    const omeApp = body?.stream?.application || body?.application || '';
+    writeSetting('webhook_seen', '1');
+
+    if (omeApp === 'app') {
+      const mode = priorityOn() ? 'priority' : 'full';
+      writeSetting('live_run_mode', mode);
+      console.log(`[Webhook] live stream starting in "${mode}" mode.`);
+      if (mode === 'priority') return res.json({ allowed: true, reason: 'episode has priority', outputProfiles: buildPriorityProfiles() });
+    } else if (omeApp === 'episode') {
+      console.log('[Webhook] episode stream starting with the full ladder.');
+    }
+    // "allowed: false" is how OME is told to build its own local profiles
+    // (Server.xml UseLocalProfilesOnServerDisallow) - tested on v0.21.0. An
+    // "allowed: true" without profiles is rejected by OME as malformed.
+    return res.json({ allowed: false, reason: 'use local profiles' });
+  } catch (err) {
+    console.error('[Webhook] error:', err.message || err);
+    return res.status(500).json({ allowed: false, reason: 'error' });
+  }
+});
+const webhookServer = http.createServer(webhookApp);
+webhookServer.on('error', (err) => console.error(`[Webhook] listener error on ${WEBHOOK_BIND}:${WEBHOOK_PORT}:`, err.message));
+webhookServer.listen(WEBHOOK_PORT, WEBHOOK_BIND, () => console.log(`[Webhook] transcode webhook listening on ${WEBHOOK_BIND}:${WEBHOOK_PORT}`));
 
 // ---------- Helpers ----------
 const RESERVED_USERNAMES = ['admin', 'administrator', 'moderator', 'system', 'root', 'support'];
@@ -525,14 +711,44 @@ function signToken(user) {
   );
 }
 
-function setAuthCookie(res, token) {
-  res.cookie('streamflix_session', token, {
+// The login cookie is shared by biggboss24hrs.com and episode.biggboss24hrs.com
+// (Domain=.biggboss24hrs.com), so signing in on either covers both. Older
+// logins were host-only cookies; a host-only cookie and a domain cookie with
+// the same name can coexist and the browser may send the stale one first, so
+// whenever the domain cookie is written the host-only one is expired in the
+// same response.
+function setAuthCookie(res, token, { expires } = {}) {
+  const opts = {
     httpOnly: true,       // JS on the page can never read this — protects against XSS token theft
     secure: IS_PROD,
     path: '/',     // only sent over HTTPS in production
-    sameSite: 'lax',
-    maxAge: 30 * 24 * 60 * 60 * 1000
-  });
+    sameSite: 'lax'
+  };
+  if (expires) opts.expires = expires; else opts.maxAge = 30 * 24 * 60 * 60 * 1000;
+  if (IS_PROD) {
+    res.clearCookie('streamflix_session', { path: '/', secure: true, httpOnly: true, sameSite: 'lax' });
+    opts.domain = COOKIE_DOMAIN;
+  }
+  res.cookie('streamflix_session', token, opts);
+}
+
+function clearAuthCookie(res) {
+  res.clearCookie('streamflix_session', { path: '/' });
+  if (IS_PROD) res.clearCookie('streamflix_session', { path: '/', domain: COOKIE_DOMAIN });
+}
+
+// Where to send someone after sign-in. Only a relative path on this site or
+// one of our own two hostnames is ever accepted - anything else (another
+// domain, protocol-relative //host, backslash tricks) is dropped, so the
+// login and OAuth flows can't be used as an open redirect.
+function safeReturnTo(value) {
+  if (typeof value !== 'string' || value.length === 0 || value.length > 300) return null;
+  if (value.startsWith('/') && !value.startsWith('//') && !value.startsWith('/\\')) return value;
+  try {
+    const u = new URL(value);
+    if (u.protocol === 'https:' && (u.origin === SITE_ORIGIN || u.origin === EPISODE_ORIGIN)) return u.toString();
+  } catch {}
+  return null;
 }
 
 function requireAuth(req, res, next) {
@@ -655,9 +871,13 @@ const presenceMap = new Map(); // userId -> { username, socketIds: Set, connecte
 // which is what made it "look fake".
 const anonPresenceMap = new Map(); // viewerId -> Set(socketIds)
 
-function broadcastViewerCount() {
-  const distinctCount = presenceMap.size + anonPresenceMap.size;
-  io.emit('viewer_count', distinctCount);
+// "Watching" is counted per channel: distinct people connected to that page.
+// A person with both pages open counts once on each. Kept incrementally
+// (viewerKey -> that viewer's socket ids), so connect/disconnect stay O(1).
+const channelViewers = { live: new Map(), episode: new Map() };
+
+function broadcastViewerCount(channel) {
+  io.to(roomOf(channel)).emit('viewer_count', channelViewers[channel].size);
 }
 
 // Crude UA sniff, only for the admin presence view ("who's on desktop") -
@@ -669,6 +889,8 @@ function classifyDevice(userAgent) {
 }
 
 io.on('connection', (socket) => {
+  const channel = channelOfSocket(socket);
+  socket.join(roomOf(channel));
   const presenceUserId = socket.user?.id || null;
   const anonViewerId = !presenceUserId && typeof socket.handshake.auth?.viewerId === 'string'
     ? socket.handshake.auth.viewerId.slice(0, 64)
@@ -698,12 +920,18 @@ io.on('connection', (socket) => {
     }
     ids.add(socket.id);
   }
-  broadcastViewerCount();
+  const viewerKey = presenceUserId ? `u:${presenceUserId}` : (anonViewerId ? `a:${anonViewerId}` : null);
+  if (viewerKey) {
+    let sockets = channelViewers[channel].get(viewerKey);
+    if (!sockets) { sockets = new Set(); channelViewers[channel].set(viewerKey, sockets); }
+    sockets.add(socket.id);
+  }
+  broadcastViewerCount(channel);
 
   // A (re)connecting player may have missed restarts while its socket was
   // down (backgrounded tab, network drop) - it compares this sessionId with
   // the one it's playing and rebuilds if they differ.
-  if (streamState.live !== null) socket.emit('stream_state', streamState);
+  if (streamStates[channel].live !== null) socket.emit('stream_state', streamStates[channel]);
 
   socket.on('disconnect', () => {
     if (presenceUserId) {
@@ -720,7 +948,14 @@ io.on('connection', (socket) => {
         if (ids.size === 0) anonPresenceMap.delete(anonViewerId);
       }
     }
-    broadcastViewerCount();
+    if (viewerKey) {
+      const sockets = channelViewers[channel].get(viewerKey);
+      if (sockets) {
+        sockets.delete(socket.id);
+        if (sockets.size === 0) channelViewers[channel].delete(viewerKey);
+      }
+    }
+    broadcastViewerCount(channel);
   });
 
   const senderUsername = socket.user?.username || 'User';
@@ -746,9 +981,9 @@ io.on('connection', (socket) => {
              u.google_pfp_url as googlePfpUrl
       FROM chat_messages cm
       LEFT JOIN users u ON LOWER(cm.username) = LOWER(u.username)
-      WHERE cm.created_at >= datetime('now', '-24 hours')
+      WHERE cm.created_at >= datetime('now', '-24 hours') AND cm.channel = ?
       ORDER BY cm.id ASC
-    `).all();
+    `).all(channel);
 
     socket.emit('chat_history', history);
   } catch (err) {
@@ -763,14 +998,14 @@ io.on('connection', (socket) => {
     try {
       // Save message into SQLite
       const info = db.prepare(`
-        INSERT INTO chat_messages (username, message) 
-        VALUES (?, ?)
-      `).run(senderUsername, cleanMsg);
+        INSERT INTO chat_messages (username, message, channel)
+        VALUES (?, ?, ?)
+      `).run(senderUsername, cleanMsg, channel);
 
       const timestamp = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 
-      // Broadcast to ALL connected users
-      io.emit('receive_message', {
+      // Broadcast to everyone on this page (not the other channel's page)
+      io.to(roomOf(channel)).emit('receive_message', {
         id: info.lastInsertRowid,
         username: senderUsername,
         message: cleanMsg,
@@ -841,11 +1076,24 @@ app.post('/api/login', loginLimiter, async (req, res) => {
 });
 
 app.post('/api/logout', (req, res) => {
-  res.clearCookie('streamflix_session');
+  clearAuthCookie(res);
+  res.clearCookie('sf_dom', { path: '/', domain: IS_PROD ? COOKIE_DOMAIN : undefined });
   res.json({ ok: true });
 });
 
 app.get('/api/me', requireAuth, (req, res) => {
+  // Viewers who signed in before the episode page existed hold a host-only
+  // cookie that the episode subdomain never receives. The first time they
+  // open the main site after this change, re-issue the SAME token (same
+  // expiry) as a domain cookie so they are already signed in over there. The
+  // sf_dom marker makes this happen once per browser, not on every heartbeat.
+  if (IS_PROD && !req.cookies.sf_dom && req.cookies.streamflix_session && req.user.exp) {
+    setAuthCookie(res, req.cookies.streamflix_session, { expires: new Date(req.user.exp * 1000) });
+    res.cookie('sf_dom', '1', {
+      secure: true, path: '/', sameSite: 'lax', domain: COOKIE_DOMAIN,
+      expires: new Date(req.user.exp * 1000)
+    });
+  }
   res.json({
     username: req.user.username,
     email: req.user.email,
@@ -893,7 +1141,7 @@ app.get('/api/admin/presence', requireAuth, requireAdmin, (req, res) => {
       connectedSince: new Date(entry.connectedAt).toISOString()
     });
   }
-  res.json({ totalConnected: connected.length, connected });
+  res.json({ totalConnected: connected.length, connected, byChannel: { live: channelViewers.live.size, episode: channelViewers.episode.size } });
 });
 
 // POST /api/admin/kick { username } - force-disconnects every live socket
@@ -1005,8 +1253,9 @@ app.post('/api/admin/ban', requireAuth, requireAdmin, (req, res) => {
 // have collapsed that and roughly 4-5x'd origin egress - verified this
 // tradeoff before relying on it, since OME's own docs don't state whether
 // segments need signing.
-const OME_PUBLIC_HOST = 'https://biggboss24hrs.com'; // what the browser actually fetches
 const OME_STREAM_APP_PATH = '/app/stream';
+// Each channel's stream lives under its own OME application / URL prefix.
+const CHANNEL_STREAM_PATH = { live: '/app/stream', episode: '/episode/stream' };
 
 // CRITICAL, verified empirically (not from docs - OME's own docs don't say
 // this): the string OME signs against is NOT the public-facing URL. OME
@@ -1022,7 +1271,7 @@ const OME_STREAM_APP_PATH = '/app/stream';
 // against the running container before trusting either.
 const OME_INTERNAL_SIGNING_ORIGIN = 'http://biggboss24hrs.com:3333';
 
-function signOmeUrl(path, ttlMs) {
+function signOmeUrl(path, ttlMs, publicHost = 'https://biggboss24hrs.com') {
   const policy = Buffer.from(JSON.stringify({ url_expire: Date.now() + ttlMs })).toString('base64url');
   const signedString = `${OME_INTERNAL_SIGNING_ORIGIN}${path}?policy=${policy}`;
   const signature = crypto.createHmac('sha1', process.env.OME_SIGNED_POLICY_KEY)
@@ -1030,15 +1279,15 @@ function signOmeUrl(path, ttlMs) {
   // The query string (policy + signature) is what actually matters and
   // travels through nginx/Cloudflare unchanged - the URL handed to the
   // browser uses the real public host so it actually reaches the site.
-  return `${OME_PUBLIC_HOST}${path}?policy=${policy}&signature=${signature}`;
+  return `${publicHost}${path}?policy=${policy}&signature=${signature}`;
 }
 
-const STREAM_QUALITY_PATHS = {
-  auto:  { label: 'Auto',  path: `${OME_STREAM_APP_PATH}/llhls.m3u8` },
-  q1080: { label: '1080p', path: `${OME_STREAM_APP_PATH}/q1080.m3u8` },
-  q720:  { label: '720p',  path: `${OME_STREAM_APP_PATH}/q720.m3u8` },
-  q480:  { label: '480p',  path: `${OME_STREAM_APP_PATH}/q480.m3u8` },
-  q360:  { label: '360p',  path: `${OME_STREAM_APP_PATH}/q360.m3u8` }
+const STREAM_QUALITY_FILES = {
+  auto:  { label: 'Auto',  file: 'llhls.m3u8' },
+  q1080: { label: '1080p', file: 'q1080.m3u8' },
+  q720:  { label: '720p',  file: 'q720.m3u8' },
+  q480:  { label: '480p',  file: 'q480.m3u8' },
+  q360:  { label: '360p',  file: 'q360.m3u8' }
 };
 
 // 12h so a long broadcast is never interrupted mid-session - url_expire
@@ -1053,14 +1302,36 @@ const STREAM_URL_TTL_MS = 12 * 60 * 60 * 1000;
 // requireAccessSession) because this is a JSON endpoint - requireAccessSession
 // sends the no-access HTML page with a 200, which loadStreamUrls()'s
 // `!res.ok` check wouldn't catch, only a confusing res.json() parse failure.
-app.get('/api/stream/urls', requireAuth, gateStream, (req, res) => {
+// Public, read-only: whether each stream is on air right now. Drives the live
+// dot on the home page's Episode button; exposes nothing about viewers or URLs.
+app.get('/api/stream/status', (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  res.json({ live: streamStates.live.live === true, episode: streamStates.episode.live === true });
+});
+
+// The episode channel is under the same rotating access link as /live (Phase
+// 2). The flag stays so it can be relaxed again without a code change.
+const EPISODE_REQUIRES_ACCESS_LINK = true;
+function gateStreamForChannel(req, res, next) {
+  if (channelOf(req) === 'episode' && !EPISODE_REQUIRES_ACCESS_LINK) return next();
+  return gateStream(req, res, next);
+}
+
+app.get('/api/stream/urls', requireAuth, gateStreamForChannel, (req, res) => {
   if (!process.env.OME_SIGNED_POLICY_KEY) {
     console.error('[Stream URLs] OME_SIGNED_POLICY_KEY not configured');
     return res.status(503).json({ error: 'Stream signing is not configured' });
   }
+  const channel = channelOf(req);
+  // The URL is built on the hostname the viewer is actually on, so the player
+  // stays same-origin. The signature is unaffected: OME verifies it against
+  // its own internal origin (OME_INTERNAL_SIGNING_ORIGIN), not this host.
+  const publicHost = channel === 'episode' ? EPISODE_ORIGIN : 'https://biggboss24hrs.com';
   const qualities = {};
-  for (const [key, { label, path }] of Object.entries(STREAM_QUALITY_PATHS)) {
-    qualities[key] = { label, url: signOmeUrl(path, STREAM_URL_TTL_MS) };
+  const available = new Set(availableQualityKeys(channel));
+  for (const [key, { label, file }] of Object.entries(STREAM_QUALITY_FILES)) {
+    if (!available.has(key)) continue;
+    qualities[key] = { label, url: signOmeUrl(`${CHANNEL_STREAM_PATH[channel]}/${file}`, STREAM_URL_TTL_MS, publicHost) };
   }
   res.json({ qualities });
 });
@@ -1104,7 +1375,7 @@ app.get('/api/auth/x/start', (req, res) => {
 
   // Ephemeral OAuth state, kept the same way access_session is - a signed,
   // short-expiry JWT in a cookie - rather than a new DB table + sweeper.
-  const oauthJwt = jwt.sign({ type: 'x_oauth', state, codeVerifier }, JWT_SECRET, { expiresIn: '10m' });
+  const oauthJwt = jwt.sign({ type: 'x_oauth', state, codeVerifier, returnTo: safeReturnTo(req.query.return) }, JWT_SECRET, { expiresIn: '10m' });
   res.cookie('x_oauth', oauthJwt, {
     httpOnly: true,
     secure: IS_PROD,
@@ -1267,7 +1538,7 @@ app.get('/api/auth/x/callback', async (req, res) => {
     setAuthCookie(res, token);
 
     console.log(`[X Signup] ${result.outcome === 'signup' ? 'New' : 'Returning'} X user @${xHandle} (verified=${!!xVerified}) logged in.`);
-    return res.redirect('/live');
+    return res.redirect(safeReturnTo(oauthPayload.returnTo) || '/live');
   } catch (err) {
     return failRedirect(err.message || err);
   }
@@ -1326,7 +1597,7 @@ app.get('/api/auth/google/start', (req, res) => {
 
   // Same ephemeral-cookie pattern as x_oauth above - a signed, short-expiry
   // JWT rather than a new DB table + sweeper.
-  const oauthJwt = jwt.sign({ type: 'google_oauth', state, codeVerifier }, JWT_SECRET, { expiresIn: '10m' });
+  const oauthJwt = jwt.sign({ type: 'google_oauth', state, codeVerifier, returnTo: safeReturnTo(req.query.return) }, JWT_SECRET, { expiresIn: '10m' });
   res.cookie('google_oauth', oauthJwt, {
     httpOnly: true,
     secure: IS_PROD,
@@ -1466,7 +1737,7 @@ app.get('/api/auth/google/callback', async (req, res) => {
       const suggested = deriveGoogleUsername(googleEmail);
       const suggestedUsername = RESERVED_USERNAMES.includes(suggested.toLowerCase()) ? suggested + '_g' : suggested;
       const pendingJwt = jwt.sign(
-        { type: 'google_pending', googleId, googleEmail, googleName, googlePfpUrl, suggestedUsername },
+        { type: 'google_pending', googleId, googleEmail, googleName, googlePfpUrl, suggestedUsername, returnTo: safeReturnTo(oauthPayload.returnTo) },
         JWT_SECRET,
         { expiresIn: '15m' }
       );
@@ -1484,7 +1755,7 @@ app.get('/api/auth/google/callback', async (req, res) => {
     setAuthCookie(res, token);
 
     console.log(`[Google Signup] ${result.outcome} for ${googleEmail} (user id ${result.user.id}).`);
-    return res.redirect('/live');
+    return res.redirect(safeReturnTo(oauthPayload.returnTo) || '/live');
   } catch (err) {
     return failRedirect(err.message || err);
   }
@@ -1550,7 +1821,7 @@ app.post('/api/auth/google/complete', (req, res) => {
     setAuthCookie(res, token);
     res.clearCookie('google_pending');
     console.log(`[Google Signup] New account "${cleanUsername}" completed for ${payload.googleEmail} (avatar=${useAvatar}).`);
-    res.json({ success: true, redirect: '/live' });
+    res.json({ success: true, redirect: safeReturnTo(payload.returnTo) || '/live' });
   } catch (err) {
     console.error('[Google Signup] Complete failed:', err);
     res.status(500).json({ error: 'Something went wrong finishing sign-in. Please try again.' });
@@ -1567,15 +1838,11 @@ app.post('/api/stream-title', requireAuth, requireAdmin, (req, res) => {
 
   try {
     const cleanTitle = title.trim();
-    db.prepare(`
-      INSERT INTO settings (key, value) VALUES ('stream_title', ?)
-      ON CONFLICT(key) DO UPDATE SET value = excluded.value
-    `).run(cleanTitle);
+    const channel = channelOf(req);
+    writeSetting(titleKey(channel), cleanTitle);
 
-    // Broadcast new title in real-time to all connected viewers!
-    if (typeof io !== 'undefined') {
-      io.emit('stream_title_updated', { title: cleanTitle });
-    }
+    // Broadcast new title in real-time to everyone on this page
+    io.to(roomOf(channel)).emit('stream_title_updated', { title: cleanTitle });
 
     return res.json({ success: true, title: cleanTitle });
   } catch (err) {
@@ -1587,10 +1854,9 @@ app.post('/api/stream-title', requireAuth, requireAdmin, (req, res) => {
 // GET: Fetch current title on page load
 app.get('/api/stream-title', (req, res) => {
   try {
-    const row = db.prepare(`SELECT value FROM settings WHERE key = 'stream_title'`).get();
-    return res.json({ title: row ? row.value : TITLE_DEFAULT });
+    return res.json({ title: getTitle(channelOf(req)) });
   } catch (err) {
-    return res.json({ title: TITLE_DEFAULT });
+    return res.json({ title: TITLE_DEFAULTS[channelOf(req)] });
   }
 });
 
@@ -1749,6 +2015,7 @@ function buildPollPayload(pollId, userId) {
 
   return {
     id: poll.id,
+    channel: poll.channel || 'live',
     question: poll.question,
     status: poll.status,
     created_at: poll.created_at,
@@ -1767,7 +2034,10 @@ function buildPollPayload(pollId, userId) {
 const pollResultsThrottle = new Map();
 
 function broadcastPollResults(pollId, { immediate = false } = {}) {
-  const emit = () => io.emit('poll_results', buildPollPayload(pollId, null));
+  const emit = () => {
+    const payload = buildPollPayload(pollId, null);
+    if (payload) io.to(roomOf(payload.channel)).emit('poll_results', payload);
+  };
 
   if (immediate) {
     const entry = pollResultsThrottle.get(pollId);
@@ -1817,9 +2087,9 @@ app.get('/api/polls/active', (req, res) => {
     // closed poll has NULL expires_at and must NOT resurface here.
     const rows = db.prepare(`
       SELECT id FROM polls
-      WHERE status = 'open' OR (expires_at IS NOT NULL AND expires_at > datetime('now'))
+      WHERE channel = ? AND (status = 'open' OR (expires_at IS NOT NULL AND expires_at > datetime('now')))
       ORDER BY id DESC
-    `).all();
+    `).all(channelOf(req));
     const userId = optionalUserId(req);
     res.json({ polls: rows.map(r => buildPollPayload(r.id, userId)) });
   } catch (err) {
@@ -1831,7 +2101,7 @@ app.get('/api/polls/active', (req, res) => {
 // GET /api/polls/history — recent closed polls with final results (public)
 app.get('/api/polls/history', (req, res) => {
   try {
-    const rows = db.prepare(`SELECT id FROM polls WHERE status = 'closed' ORDER BY id DESC LIMIT 10`).all();
+    const rows = db.prepare(`SELECT id FROM polls WHERE channel = ? AND status = 'closed' ORDER BY id DESC LIMIT 10`).all(channelOf(req));
     res.json({ polls: rows.map(r => buildPollPayload(r.id, null)) });
   } catch (err) {
     console.error('Fetch poll history error:', err);
@@ -1897,20 +2167,23 @@ app.post('/api/polls', requireAuth, requireAdmin, (req, res) => {
     // the insert to avoid a race between the check and the create. The
     // lifecycle is now purely time-driven: 12h open, then 8h showing
     // results, then deleted by sweepPolls() - there is no manual close.
+    // Polls belong to the page they are created from, and the limit of
+    // POLL_MAX_ACTIVE applies per page.
+    const channel = channelOf(req);
     let capacityError = false;
     const createPoll = db.transaction(() => {
       const { count } = db.prepare(`
         SELECT COUNT(*) AS count FROM polls
-        WHERE status = 'open' OR (expires_at IS NOT NULL AND expires_at > datetime('now'))
-      `).get();
+        WHERE channel = ? AND (status = 'open' OR (expires_at IS NOT NULL AND expires_at > datetime('now')))
+      `).get(channel);
       if (count >= POLL_MAX_ACTIVE) {
         capacityError = true;
         return null;
       }
       const info = db.prepare(`
-        INSERT INTO polls (question, created_by, closes_at, expires_at)
-        VALUES (?, ?, datetime('now', '+${POLL_RUN_HOURS} hours'), datetime('now', '+${POLL_RUN_HOURS + POLL_RESULTS_HOURS} hours'))
-      `).run(cleanQuestion, req.user.username);
+        INSERT INTO polls (question, created_by, channel, closes_at, expires_at)
+        VALUES (?, ?, ?, datetime('now', '+${POLL_RUN_HOURS} hours'), datetime('now', '+${POLL_RUN_HOURS + POLL_RESULTS_HOURS} hours'))
+      `).run(cleanQuestion, req.user.username, channel);
       const insertOption = db.prepare('INSERT INTO poll_options (poll_id, label, position) VALUES (?, ?, ?)');
       cleanOptions.forEach((label, i) => insertOption.run(info.lastInsertRowid, label, i));
       return info.lastInsertRowid;
@@ -1922,7 +2195,7 @@ app.post('/api/polls', requireAuth, requireAdmin, (req, res) => {
     }
 
     const payload = buildPollPayload(pollId, null);
-    io.emit('poll_started', payload);
+    io.to(roomOf(channel)).emit('poll_started', payload);
     res.json({ success: true, poll: payload });
   } catch (err) {
     console.error('Create poll error:', err);
@@ -1934,6 +2207,7 @@ app.post('/api/polls', requireAuth, requireAdmin, (req, res) => {
 app.delete('/api/polls/:id', requireAuth, requireAdmin, (req, res) => {
   try {
     const pollId = Number(req.params.id);
+    const pollChannel = db.prepare('SELECT channel FROM polls WHERE id = ?').get(pollId)?.channel || 'live';
     // Children removed explicitly - FK cascade isn't relied on here, matching
     // how the library folder delete is written.
     const removePoll = db.transaction(() => {
@@ -1945,7 +2219,7 @@ app.delete('/api/polls/:id', requireAuth, requireAdmin, (req, res) => {
     const info = removePoll();
     if (info.changes === 0) return res.status(404).json({ error: 'Poll not found' });
 
-    io.emit('poll_closed', { id: pollId, deleted: true });
+    io.to(roomOf(pollChannel)).emit('poll_closed', { id: pollId, deleted: true });
     res.json({ success: true });
   } catch (err) {
     console.error('Delete poll error:', err);
@@ -1970,6 +2244,7 @@ app.post('/api/polls/:id/end', requireAuth, requireAdmin, (req, res) => {
     // Read while the votes/options rows still exist - buildPollPayload joins
     // against them, so it must run before the delete below.
     const finalPayload = buildPollPayload(pollId, null);
+    const pollChannel = finalPayload.channel;
     finalPayload.status = 'closed';
     finalPayload.closed_at = new Date().toISOString();
 
@@ -1987,7 +2262,7 @@ app.post('/api/polls/:id/end', requireAuth, requireAdmin, (req, res) => {
     // row is already gone. A fresh page load won't see it (not in history -
     // the row is deleted, not just status-flipped), which is the "delete"
     // half of what this route promises.
-    io.emit('poll_closed', finalPayload);
+    io.to(roomOf(pollChannel)).emit('poll_closed', finalPayload);
 
     res.json({ success: true, poll: finalPayload });
   } catch (err) {
@@ -2003,19 +2278,19 @@ app.post('/api/polls/:id/end', requireAuth, requireAdmin, (req, res) => {
 function sweepPolls() {
   try {
     const toClose = db.prepare(`
-      SELECT id FROM polls WHERE status = 'open' AND closes_at <= datetime('now')
+      SELECT id, channel FROM polls WHERE status = 'open' AND closes_at <= datetime('now')
     `).all();
     if (toClose.length > 0) {
       const closeStmt = db.prepare(`UPDATE polls SET status = 'closed', closed_at = CURRENT_TIMESTAMP WHERE id = ?`);
-      toClose.forEach(({ id }) => {
+      toClose.forEach(({ id, channel }) => {
         closeStmt.run(id);
-        io.emit('poll_closed', buildPollPayload(id, null));
+        io.to(roomOf(channel || 'live')).emit('poll_closed', buildPollPayload(id, null));
       });
       console.log(`[Poll Sweep] Auto-closed ${toClose.length} poll(s).`);
     }
 
     const toDelete = db.prepare(`
-      SELECT id FROM polls WHERE expires_at IS NOT NULL AND expires_at <= datetime('now')
+      SELECT id, channel FROM polls WHERE expires_at IS NOT NULL AND expires_at <= datetime('now')
     `).all();
     if (toDelete.length > 0) {
       const removePoll = db.transaction((id) => {
@@ -2023,9 +2298,9 @@ function sweepPolls() {
         db.prepare('DELETE FROM poll_options WHERE poll_id = ?').run(id);
         db.prepare('DELETE FROM polls WHERE id = ?').run(id);
       });
-      toDelete.forEach(({ id }) => {
+      toDelete.forEach(({ id, channel }) => {
         removePoll(id);
-        io.emit('poll_closed', { id, deleted: true });
+        io.to(roomOf(channel || 'live')).emit('poll_closed', { id, deleted: true });
       });
       console.log(`[Poll Sweep] Deleted ${toDelete.length} expired poll(s).`);
     }
@@ -2044,8 +2319,9 @@ setInterval(sweepPolls, 60 * 1000);
 // archive, so keeping a saved copy would just duplicate data we already have.
 // The file lives just long enough to stream to the requester, then it's gone.
 const CLIP_TMP_DIR = '/tmp/streamflix-clips';
-const CLIP_ORIGIN = 'http://127.0.0.1:3333/app';
 const CLIP_STREAM_NAME = 'stream';
+// Loopback base of a channel's OME application (clips never go through nginx/Cloudflare).
+function clipOrigin(channel) { return `http://127.0.0.1:3333/${CHANNEL_OME_APP[channel]}`; }
 const CLIP_MAX_DURATION_SEC = 60; // was 30 - raised so Share/Download can cover a full Reels/Story-length moment
 const CLIP_MAX_CONCURRENT = 8;
 const CLIP_MAX_QUEUE_DEPTH = 30;
@@ -2119,7 +2395,7 @@ function clipRecordBytes(userId, bytes) {
 // framing); '720p' picks the closest match to 720p; anything else (including
 // the default) picks the tallest available - the bypass track, full quality,
 // for an actual Download.
-async function getClipSourceChunklists(quality) {
+async function getClipSourceChunklists(quality, channel = 'live') {
   // SignedPolicy now gates the manifest (not chunklists/segments), so this
   // loopback fetch needs a signature too - it was missed in the original
   // rollout since only the browser-facing path (/api/stream/urls) and RTMP
@@ -2133,8 +2409,9 @@ async function getClipSourceChunklists(quality) {
   // http.request with the same header succeeded (200). OME needs that
   // header to know which virtual host's signing key to verify against,
   // since the loopback request otherwise arrives as Host: 127.0.0.1:3333.
-  const signedQuery = signOmeUrl(`/app/${CLIP_STREAM_NAME}/llhls.m3u8`, 5 * 60 * 1000).split('?')[1];
-  const masterPath = `/app/${CLIP_STREAM_NAME}/llhls.m3u8?${signedQuery}`;
+  const omeApp = CHANNEL_OME_APP[channel];
+  const signedQuery = signOmeUrl(`/${omeApp}/${CLIP_STREAM_NAME}/llhls.m3u8`, 5 * 60 * 1000).split('?')[1];
+  const masterPath = `/${omeApp}/${CLIP_STREAM_NAME}/llhls.m3u8?${signedQuery}`;
   const text = await new Promise((resolve, reject) => {
     const req = http.request({
       hostname: '127.0.0.1',
@@ -2188,8 +2465,8 @@ async function getClipSourceChunklists(quality) {
   }
 
   return {
-    videoChunklistUrl: `${CLIP_ORIGIN}/${CLIP_STREAM_NAME}/${videoChunklist}`,
-    audioChunklistUrl: `${CLIP_ORIGIN}/${CLIP_STREAM_NAME}/${audioChunklist}`
+    videoChunklistUrl: `${clipOrigin(channel)}/${CLIP_STREAM_NAME}/${videoChunklist}`,
+    audioChunklistUrl: `${clipOrigin(channel)}/${CLIP_STREAM_NAME}/${audioChunklist}`
   };
 }
 
@@ -2276,7 +2553,7 @@ const CLIP_ALLOWED_QUALITIES = new Set(['preview', '720p', '1080p']);
 // response itself; does NOT touch the byte budget - callers decide whether
 // and when to charge it, since the GET route's cost only applies to whoever
 // actually causes a cache MISS.
-async function cutAndStreamClip(req, res, { startMs, durationSec, quality, onProduced }) {
+async function cutAndStreamClip(req, res, { startMs, durationSec, quality, onProduced, channel = 'live' }) {
   if (clipActiveJobs >= CLIP_MAX_CONCURRENT && clipQueueDepth >= CLIP_MAX_QUEUE_DEPTH) {
     return res.status(429).json({ error: 'Server busy cutting clips - try again in a moment.' });
   }
@@ -2303,7 +2580,7 @@ async function cutAndStreamClip(req, res, { startMs, durationSec, quality, onPro
   let ffmpegProc = null;
 
   try {
-    const { videoChunklistUrl, audioChunklistUrl } = await getClipSourceChunklists(quality);
+    const { videoChunklistUrl, audioChunklistUrl } = await getClipSourceChunklists(quality, channel);
     const endMs = startMs + durationSec * 1000;
 
     // Both tracks are fetched into local files first - ffmpeg then seeks
@@ -2394,6 +2671,7 @@ app.post('/api/clips', requireAuth, async (req, res) => {
   // sizes vary too much across quality/duration combinations to guess.
   await cutAndStreamClip(req, res, {
     startMs, durationSec, quality,
+    channel: channelOf(req),
     onProduced: (bytes) => clipRecordBytes(userId, bytes)
   });
 });
@@ -2417,9 +2695,15 @@ app.post('/api/clips', requireAuth, async (req, res) => {
 // one cache entry instead of each paying full egress.
 const CLIP_QUANTUM_SEC = 2;
 
-function clipSignature(startSec, durationSec, quality) {
+// The live channel keeps the original signed string so clip links already
+// handed out stay valid; the episode channel adds its name, so its links
+// can never collide with (or be forged from) a live link for the same
+// timestamp - they also sit under a different URL path, which keeps the
+// Cloudflare cache entries apart.
+function clipSignature(startSec, durationSec, quality, channel = 'live') {
+  const suffix = channel === 'live' ? '' : `|${channel}`;
   return crypto.createHmac('sha256', process.env.CLIP_SIGNING_SECRET)
-    .update(`${startSec}|${durationSec}|${quality}`)
+    .update(`${startSec}|${durationSec}|${quality}${suffix}`)
     .digest('hex')
     .slice(0, 24);
 }
@@ -2443,7 +2727,8 @@ app.post('/api/clips/sign', requireAuth, (req, res) => {
   }
 
   const startSec = Math.floor(startMs / 1000 / CLIP_QUANTUM_SEC) * CLIP_QUANTUM_SEC;
-  const sig = clipSignature(startSec, durationSec, quality);
+  const channel = channelOf(req);
+  const sig = clipSignature(startSec, durationSec, quality, channel);
 
   // Charged here at an estimate, not after the fact: whether this URL turns
   // into an origin cut at all depends on cache state we don't control, so
@@ -2452,10 +2737,11 @@ app.post('/api/clips/sign', requireAuth, (req, res) => {
   const ESTIMATED_BYTES_PER_SEC = { preview: 40000, '720p': 125000, '1080p': 520000 };
   clipRecordBytes(userId, durationSec * (ESTIMATED_BYTES_PER_SEC[quality] || ESTIMATED_BYTES_PER_SEC['1080p']));
 
-  res.json({ url: `/api/clips/${startSec}/${durationSec}/${quality}/${sig}.mp4` });
+  const prefix = channel === 'live' ? '/api/clips' : `/api/clips/${channel}`;
+  res.json({ url: `${prefix}/${startSec}/${durationSec}/${quality}/${sig}.mp4` });
 });
 
-app.get('/api/clips/:startSec/:durationSec/:quality/:sig.mp4', async (req, res) => {
+async function handleSignedClipGet(req, res, channel) {
   const startSec = Number(req.params.startSec);
   const durationSec = Number(req.params.durationSec);
   const quality = req.params.quality;
@@ -2466,7 +2752,7 @@ app.get('/api/clips/:startSec/:durationSec/:quality/:sig.mp4', async (req, res) 
     return res.status(400).json({ error: 'Invalid clip parameters' });
   }
 
-  const expectedSig = clipSignature(startSec, durationSec, quality);
+  const expectedSig = clipSignature(startSec, durationSec, quality, channel);
   const providedSig = String(req.params.sig || '');
   const expectedBuf = Buffer.from(expectedSig);
   const providedBuf = Buffer.from(providedSig);
@@ -2476,8 +2762,11 @@ app.get('/api/clips/:startSec/:durationSec/:quality/:sig.mp4', async (req, res) 
     return res.status(403).json({ error: 'Invalid or expired clip link' });
   }
 
-  await cutAndStreamClip(req, res, { startMs: startSec * 1000, durationSec, quality });
-});
+  await cutAndStreamClip(req, res, { startMs: startSec * 1000, durationSec, quality, channel });
+}
+
+app.get('/api/clips/:startSec/:durationSec/:quality/:sig.mp4', (req, res) => handleSignedClipGet(req, res, 'live'));
+app.get('/api/clips/episode/:startSec/:durationSec/:quality/:sig.mp4', (req, res) => handleSignedClipGet(req, res, 'episode'));
 
 // Bound to loopback only - nginx is the sole intended caller (it already
 // proxies here via http://127.0.0.1:4000 in every location block). This

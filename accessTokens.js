@@ -114,13 +114,44 @@ function verifyAccessCookie(req) {
 // to hand OAuth logins a free 24h access_session - is removed for the same
 // reason; see its former call sites in the X/Google callbacks.
 function requireAccessSession(req, res, next) {
-  if (verifyAccessCookie(req)) return next();
+  const payload = verifyAccessCookie(req);
+  if (payload) { upgradeAccessCookie(req, res, payload); return next(); }
   return res.status(200).sendFile(NO_ACCESS_PAGE);
 }
 
 function gateStream(req, res, next) {
-  if (verifyAccessCookie(req)) return next();
+  const payload = verifyAccessCookie(req);
+  if (payload) { upgradeAccessCookie(req, res, payload); return next(); }
   return res.status(403).send('Forbidden: valid access session required.');
+}
+
+// The access cookie is shared by biggboss24hrs.com and
+// episode.biggboss24hrs.com (Domain=.biggboss24hrs.com), so ONE redeemed link
+// unlocks both pages. Links redeemed before the episode page existed left a
+// host-only cookie that the episode address never receives; the first time
+// such a viewer loads a gated page on the main site, the SAME token (same
+// expiry) is re-issued as a domain cookie, so they do not need to redeem
+// again. The sf_acc marker makes that happen once per browser rather than on
+// every request. A host-only cookie and a domain cookie of the same name can
+// coexist, so whenever the domain cookie is written the host-only one is
+// expired in the same response.
+const COOKIE_DOMAIN = '.biggboss24hrs.com';
+
+function setAccessCookie(res, token, expiresAt) {
+  const opts = { httpOnly: true, secure: _isProd, path: '/', sameSite: 'lax', expires: new Date(expiresAt) };
+  if (_isProd) {
+    res.clearCookie('access_session', { path: '/', secure: true, httpOnly: true, sameSite: 'lax' });
+    opts.domain = COOKIE_DOMAIN;
+  }
+  res.cookie('access_session', token, opts);
+}
+
+function upgradeAccessCookie(req, res, payload) {
+  if (!_isProd || req.cookies.sf_acc || !payload.exp) return;
+  setAccessCookie(res, req.cookies.access_session, payload.exp * 1000);
+  res.cookie('sf_acc', '1', {
+    secure: true, path: '/', sameSite: 'lax', domain: COOKIE_DOMAIN, expires: new Date(payload.exp * 1000)
+  });
 }
 
 // ─── Route: GET /access?token=xxx ─────────────────────────────────────────
@@ -158,13 +189,12 @@ function registerAccessRoute(app) {
       { expiresIn: remainingS }
     );
 
-    res.cookie('access_session', sessionJwt, {
-      httpOnly: true,
-      secure:   _isProd,
-      path:     '/',
-      sameSite: 'lax',
-      maxAge:   remainingMs
-    });
+    setAccessCookie(res, sessionJwt, row.expires_at);
+    if (_isProd) {
+      res.cookie('sf_acc', '1', {
+        secure: true, path: '/', sameSite: 'lax', domain: COOKIE_DOMAIN, expires: new Date(row.expires_at)
+      });
+    }
 
     return res.redirect('/');
   });
