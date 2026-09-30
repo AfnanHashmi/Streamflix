@@ -112,6 +112,18 @@ const loginLimiter = makeLimiter(15 * 60 * 1000, 10, 'Too many login attempts. P
 // These intercept requests for the homepage and live page and enforce the
 // access_session cookie. Static assets (CSS, JS, images) are still served
 // ungated by express.static below so no-access.html can load its own assets.
+// The episode address only ever shows the episode page. Main-site pages
+// (live, library, sign-in) belong on the main address - sign-in in particular
+// must happen there because the X/Google callbacks are registered to it - so
+// anything reaching for them on the episode address is sent across.
+app.use((req, res, next) => {
+  if (channelOf(req) === 'episode'
+      && /^\/(live|library)(\/|$)|^\/(login|signup|complete-signup)\.html$/i.test(req.path)) {
+    return res.redirect(302, SITE_ORIGIN + req.originalUrl);
+  }
+  next();
+});
+
 // episode.biggboss24hrs.com IS the episode page - its root serves that page
 // instead of the home page, behind the same rotating access link as /live.
 app.get(['/', '/index.html'], (req, res, next) => {
@@ -141,9 +153,13 @@ app.get(['/live', '/live/index.html'], requireAccessSession, (req, res) => {
 });
 
 // Serve the main website assets from /var/www/streamflix
-app.use(express.static('/var/www/streamflix'));
+// dotfiles: 'deny' refuses any path containing a dot-segment (.git/, .claude/,
+// .env ...). Express's default ('ignore') only hides dotfiles themselves, NOT
+// files inside a dot-folder - which is how the site's .git folder was
+// downloadable. nginx refuses these paths as well (first layer).
+app.use(express.static('/var/www/streamflix', { dotfiles: 'deny' }));
 // Fallback for our own public folder (e.g., no-access.html)
-app.use(express.static('public'));
+app.use(express.static('public', { dotfiles: 'deny' }));
 
 // ---------- Database setup ----------
 const db = new Database('streamflix.db');
@@ -437,19 +453,34 @@ async function omeApiDelete(url) {
   return res.json().catch(() => ({}));
 }
 
-async function purgeCloudflareCache() {
+// Cloudflare caches by host + path, and every host can serve a stream path
+// (www. included), so a channel's purge covers each of them. Purging by
+// prefix clears only that stream - the other channel's warm cache and the
+// cached clips are left alone, which matters when the episode starts and
+// /live restarts seconds later for the mode switch.
+const CHANNEL_PURGE_PREFIXES = {
+  live: ['biggboss24hrs.com/app/', 'www.biggboss24hrs.com/app/', 'episode.biggboss24hrs.com/app/'],
+  episode: ['biggboss24hrs.com/episode/', 'www.biggboss24hrs.com/episode/', 'episode.biggboss24hrs.com/episode/']
+};
+
+async function purgeCloudflareCache(channels) {
   const zoneId = process.env.CLOUDFLARE_ZONE_ID;
   const apiToken = process.env.CLOUDFLARE_API_TOKEN;
   if (!zoneId || !apiToken) {
     console.error('[Stream] Cloudflare purge skipped: CLOUDFLARE_ZONE_ID / CLOUDFLARE_API_TOKEN not set');
     return false;
   }
-  for (let attempt = 1; attempt <= 2; attempt++) {
+  const prefixes = (channels || []).flatMap(ch => CHANNEL_PURGE_PREFIXES[ch] || []);
+  // Attempts 1-2 purge just the channels' prefixes; if Cloudflare refuses
+  // that, the last attempt falls back to purging everything rather than
+  // risk serving a previous session's segments.
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const everything = prefixes.length === 0 || attempt === 3;
     try {
       const res = await fetch(`https://api.cloudflare.com/client/v4/zones/${zoneId}/purge_cache`, {
         method: 'POST',
         headers: { Authorization: `Bearer ${apiToken}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ purge_everything: true }),
+        body: JSON.stringify(everything ? { purge_everything: true } : { prefixes }),
         signal: AbortSignal.timeout(10000)
       });
       const json = await res.json().catch(() => ({}));
@@ -472,12 +503,18 @@ async function readChannelStream(channel) {
   // The API lists INPUT names (the ingest key); the playback name is pinned
   // to "stream" in Server.xml, so "/stream" below is the output's detail.
   const inputName = live ? list.response[0] : null;
+  let runMode = null; // 'full' (several video renditions) | 'priority' (1080p only) | null = not known yet
   if (live) {
     const detail = await omeApiGet(`${base}/stream`);
     sessionId = detail?.response?.input?.createdTime || null;
     if (!sessionId) throw new Error('OME stream detail has no input.createdTime');
+    // What the stream is REALLY being built as, read from OME itself rather
+    // than from what the webhook last said - if the webhook was unreachable
+    // when the stream started, OME silently built the full ladder.
+    const videoTracks = (detail?.response?.outputs?.[0]?.tracks || []).filter(t => t.type === 'Video').length;
+    if (videoTracks > 0) runMode = videoTracks > 1 ? 'full' : 'priority';
   }
-  return { live, sessionId, inputName };
+  return { live, sessionId, inputName, runMode };
 }
 
 // ---------- Episode priority mode ----------
@@ -564,24 +601,28 @@ async function pollStreamLive() {
       }
     }));
 
+    if (results.live && results.live.live && results.live.runMode && results.live.runMode !== liveRunMode()) {
+      console.log(`[Priority] Live is actually running in "${results.live.runMode}" mode (was recorded as "${liveRunMode()}") - corrected.`);
+      writeSetting('live_run_mode', results.live.runMode);
+    }
     updatePriorityFlag(results.episode);
     await reconcileLiveMode(results.live);
 
     // A new session on EITHER channel needs one purge. Session ids are
     // persisted, so a backend restart doesn't re-purge a stream that was
     // already purged - but does purge one that started while it was down.
-    let needsPurge = false;
+    const purgeChannels = [];
     for (const ch of CHANNELS) {
       const r = results[ch];
       if (r && r.live && r.sessionId !== readSetting(sessionSettingKey(ch))) {
         writeSetting(sessionSettingKey(ch), r.sessionId);
-        needsPurge = true;
+        purgeChannels.push(ch);
         console.log(`[Stream] New ${ch} session ${r.sessionId}`);
       }
     }
-    if (needsPurge) {
-      const ok = await purgeCloudflareCache();
-      console.log(`[Stream] Cloudflare purge ${ok ? 'ok' : 'FAILED'}`);
+    if (purgeChannels.length) {
+      const ok = await purgeCloudflareCache(purgeChannels);
+      console.log(`[Stream] Cloudflare purge (${purgeChannels.join('+')}) ${ok ? 'ok' : 'FAILED'}`);
     }
 
     // Emitted only after the purge above has finished, so players rebuilding
@@ -991,9 +1032,24 @@ io.on('connection', (socket) => {
   }
 
   // Handle incoming live message
+  // A packet with no body (data undefined) used to throw inside this handler
+  // and - as an uncaught exception - stopped the whole Node process, so every
+  // input is validated first. Posting needs a real account (the page itself
+  // already requires login, so this only closes the raw-socket route), is
+  // capped in length, and rate limited per account.
+  const CHAT_MAX_LEN = 500;
+  const CHAT_RATE_WINDOW_MS = 10 * 1000;
+  const CHAT_RATE_MAX = 5;
+  const chatSendTimes = [];
   socket.on('send_message', (data) => {
-    if (!data.message || !data.message.trim()) return;
-    const cleanMsg = data.message.trim();
+    if (!socket.user) return;
+    if (!data || typeof data !== 'object' || typeof data.message !== 'string') return;
+    const cleanMsg = data.message.trim().slice(0, CHAT_MAX_LEN);
+    if (!cleanMsg) return;
+    const nowMs = Date.now();
+    while (chatSendTimes.length && nowMs - chatSendTimes[0] > CHAT_RATE_WINDOW_MS) chatSendTimes.shift();
+    if (chatSendTimes.length >= CHAT_RATE_MAX) return;
+    chatSendTimes.push(nowMs);
 
     try {
       // Save message into SQLite
