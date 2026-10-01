@@ -512,7 +512,8 @@ async function readChannelStream(channel) {
     // than from what the webhook last said - if the webhook was unreachable
     // when the stream started, OME silently built the full ladder.
     const videoTracks = (detail?.response?.outputs?.[0]?.tracks || []).filter(t => t.type === 'Video').length;
-    if (videoTracks > 0) runMode = videoTracks > 1 ? 'full' : 'priority';
+    // The full ladder has 4 video renditions; priority mode has fewer (720p dropped).
+    if (videoTracks > 0) runMode = videoTracks >= 4 ? 'full' : 'priority';
   }
   return { live, sessionId, inputName, runMode };
 }
@@ -520,7 +521,7 @@ async function readChannelStream(channel) {
 // ---------- Episode priority mode ----------
 // The server can only transcode ONE full set of qualities at a time (~180% of
 // its 400% CPU each). The episode always gets the full ladder. While the
-// episode is on air, /live is produced in 1080p-only (a passthrough: ~no CPU)
+// episode is on air, /live drops its 720p rendition (the costliest one)
 // and gets its full ladder back once the episode has been off for a while.
 // OME decides a stream's qualities when the stream STARTS, by asking the
 // transcode webhook below, so a mode change on an already-running /live
@@ -543,7 +544,7 @@ function availableQualityKeys(channel) {
   const all = Object.keys(STREAM_QUALITY_FILES);
   if (channel === 'episode') return all;
   const mode = streamStates.live.live ? liveRunMode() : (priorityOn() ? 'priority' : 'full');
-  return mode === 'priority' ? ['auto', 'q1080'] : all;
+  return mode === 'priority' ? PRIORITY_QUALITY_KEYS : all;
 }
 
 function updatePriorityFlag(episode) {
@@ -552,7 +553,7 @@ function updatePriorityFlag(episode) {
     episodeOfflineSince = null;
     if (!priorityOn()) {
       writeSetting('priority_mode', '1');
-      console.log('[Priority] Episode is live - /live switches to 1080p-only.');
+      console.log('[Priority] Episode is live - /live drops 720p (keeps 1080p/480p/360p).');
     }
   } else if (priorityOn()) {
     if (episodeOfflineSince === null) episodeOfflineSince = Date.now();
@@ -633,7 +634,7 @@ async function pollStreamLive() {
       if (!r) continue;
       const prev = streamStates[ch];
       // Live viewers also learn whether the episode currently has priority,
-      // so their page can explain the 1080p-only mode.
+      // so their page can explain the reduced quality list.
       const priority = ch === 'live' ? priorityOn() : false;
       const changed = prev.live !== r.live || prev.sessionId !== r.sessionId || prev.priority !== priority;
       streamStates[ch] = { live: r.live, sessionId: r.sessionId, priority };
@@ -658,7 +659,7 @@ setInterval(pollStreamLive, STREAM_POLL_INTERVAL_MS);
 //   episode          -> answer "allowed: false" = OME builds its own local
 //                       profiles from Server.xml (the full ladder).
 //   live, normal     -> same.
-//   live, priority   -> a 1080p-only profile (bypass, near-zero CPU).
+//   live, priority   -> 1080p (bypass) + 480p + 360p, no 720p.
 // Anything going wrong (this listener down, slow, or erroring) makes OME fall
 // back to its local full ladder (UseLocalProfilesOn* in Server.xml), so a
 // stream can never fail to start because of the webhook.
@@ -667,20 +668,37 @@ const WEBHOOK_PORT = Number(process.env.OME_WEBHOOK_PORT || 4001);
 const WEBHOOK_SECRET = process.env.OME_WEBHOOK_SECRET || '';
 let webhookRequestsLogged = 0;
 
+// Live while the episode is on: the original 1080p plus 480p and 360p. Only
+// 720p - the most expensive transcode by far - is dropped. Encoder settings
+// match the local profiles in Server.xml exactly.
+const PRIORITY_QUALITY_KEYS = ['auto', 'q1080', 'q480', 'q360'];
+
 function buildPriorityProfiles() {
+  const x264 = (name, bitrate, width, height) => ({
+    name, codec: 'h264', bitrate, framerate: 30, width, height, preset: 'faster', profile: 'main', modules: 'x264'
+  });
+  const single = (label, fileName, video) => ({
+    name: label, fileName, options: { enableTsPackaging: true },
+    renditions: [{ name: fileName, video, audio: 'aac_audio' }]
+  });
   return {
     outputProfile: [{
       name: 'bypass_stream',
       outputStreamName: 'stream',
       encodes: {
-        videos: [{ name: 'bypass_video', bypass: true }],
+        videos: [{ name: 'bypass_video', bypass: true }, x264('video_480p', 1200000, 854, 480), x264('video_360p', 600000, 640, 360)],
         audios: [{ name: 'aac_audio', codec: 'aac', bitrate: 128000, samplerate: 48000, channel: 2, bypassIfMatch: { codec: 'eq' } }]
       },
       playlists: [
         { name: 'default', fileName: 'llhls', options: { hlsChunklistPathDepth: 0, enableTsPackaging: true },
-          renditions: [{ name: '1080p', video: 'bypass_video', audio: 'aac_audio' }] },
-        { name: '1080p only', fileName: 'q1080', options: { enableTsPackaging: true },
-          renditions: [{ name: 'q1080', video: 'bypass_video', audio: 'aac_audio' }] }
+          renditions: [
+            { name: '1080p', video: 'bypass_video', audio: 'aac_audio' },
+            { name: '480p', video: 'video_480p', audio: 'aac_audio' },
+            { name: '360p', video: 'video_360p', audio: 'aac_audio' }
+          ] },
+        single('1080p only', 'q1080', 'bypass_video'),
+        single('480p only', 'q480', 'video_480p'),
+        single('360p only', 'q360', 'video_360p')
       ]
     }]
   };
@@ -2509,9 +2527,12 @@ async function getClipSourceChunklists(quality, channel = 'live') {
   if (quality === 'preview') {
     videoChunklist = renditions.reduce((a, b) => (b.height < a.height ? b : a)).uri;
   } else if (quality === '720p') {
-    videoChunklist = renditions.reduce((a, b) =>
-      Math.abs(b.height - 720) < Math.abs(a.height - 720) ? b : a
-    ).uri;
+    // 720p if it exists; otherwise the next one UP (live drops 720p while the
+    // episode is on - a "720p" clip should then be sharper, not blurrier).
+    const atLeast = renditions.filter(r => r.height >= 720);
+    videoChunklist = (atLeast.length
+      ? atLeast.reduce((a, b) => (b.height < a.height ? b : a))
+      : renditions.reduce((a, b) => (b.height > a.height ? b : a))).uri;
   } else {
     videoChunklist = renditions.reduce((a, b) => (b.height > a.height ? b : a)).uri;
   }
