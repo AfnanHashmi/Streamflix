@@ -451,8 +451,8 @@ const STREAM_POLL_INTERVAL_MS = 2000;
 // the edge before the next start. After createdTime changes, OME has wiped
 // them, and the first new segment is still ~6s away - that's the window.
 const streamStates = {
-  live: { live: null, sessionId: null, priority: false },
-  episode: { live: null, sessionId: null, priority: false }
+  live: { live: null, sessionId: null },
+  episode: { live: null, sessionId: null }
 };
 
 function sessionSettingKey(channel) {
@@ -479,17 +479,6 @@ async function omeApiGet(url) {
   });
   if (!res.ok) throw new Error(`OME API returned ${res.status} for ${url}`);
   return res.json();
-}
-
-async function omeApiDelete(url) {
-  const authHeader = 'Basic ' + Buffer.from(process.env.OME_API_ACCESS_TOKEN, 'utf8').toString('base64');
-  const res = await fetch(url, {
-    method: 'DELETE',
-    headers: { Authorization: authHeader },
-    signal: AbortSignal.timeout(5000)
-  });
-  if (!res.ok) throw new Error(`OME API returned ${res.status} for DELETE ${url}`);
-  return res.json().catch(() => ({}));
 }
 
 // Cloudflare caches by host + path, and every host can serve a stream path
@@ -542,85 +531,61 @@ async function readChannelStream(channel) {
   // The API lists INPUT names (the ingest key); the playback name is pinned
   // to "stream" in Server.xml, so "/stream" below is the output's detail.
   const inputName = live ? list.response[0] : null;
-  let runMode = null; // 'full' (several video renditions) | 'priority' (1080p only) | null = not known yet
+  let heights = null; // video heights OME is really producing, null = not known
   if (live) {
     const detail = await omeApiGet(`${base}/stream`);
     sessionId = detail?.response?.input?.createdTime || null;
     if (!sessionId) throw new Error('OME stream detail has no input.createdTime');
-    // What the stream is REALLY being built as, read from OME itself rather
-    // than from what the webhook last said - if the webhook was unreachable
-    // when the stream started, OME silently built the full ladder.
-    const videoTracks = (detail?.response?.outputs?.[0]?.tracks || []).filter(t => t.type === 'Video').length;
-    // The full ladder has 4 video renditions; priority mode has fewer (720p dropped).
-    if (videoTracks > 0) runMode = videoTracks >= 4 ? 'full' : 'priority';
+    // What the stream is REALLY being built as, read from OME itself: a
+    // stream keeps the qualities it started with, so this - not a setting -
+    // decides which quality choices viewers are offered.
+    const h = (detail?.response?.outputs?.[0]?.tracks || []).filter(t => t.type === 'Video').map(t => t.video?.height);
+    if (h.length) heights = h;
   }
-  return { live, sessionId, inputName, runMode };
+  return { live, sessionId, inputName, heights };
 }
 
-// ---------- Episode priority mode ----------
-// The server can only transcode ONE full set of qualities at a time (~180% of
-// its 400% CPU each). The episode always gets the full ladder. While the
-// episode is on air, /live drops its 720p rendition (the costliest one)
-// and gets its full ladder back once the episode has been off for a while.
-// OME decides a stream's qualities when the stream STARTS, by asking the
-// transcode webhook below, so a mode change on an already-running /live
-// stream is done by briefly disconnecting its OBS input - OBS reconnects on
-// its own and the new session starts in the right mode.
-const PRIORITY_IDLE_MS = 3 * 60 * 1000;            // episode must be off this long before live gets its ladder back
-const PRIORITY_SWITCH_COOLDOWN_MS = 2 * 60 * 1000; // never disconnect live more than once per this window
-const PRIORITY_MAX_FAILED_SWITCHES = 2;            // give up (and log) instead of flapping if a switch doesn't take
-let episodeOfflineSince = null;
-let lastPrioritySwitchAt = 0;
-let failedPrioritySwitches = 0;
+// ---------- Quality lists ----------
+// Live is produced as 1080p (passthrough) + 720p + 360p (see
+// buildLiveProfiles below); the episode keeps the full ladder. The server can
+// only transcode about one full ladder at a time, so live skips 480p - the
+// same stream, all day, so nothing ever has to restart when the episode
+// starts or ends. A stream keeps the qualities it started with, so the list
+// offered to viewers follows what OME is really producing.
+const LIVE_QUALITY_KEYS = ['auto', 'q1080', 'q720', 'q360'];
+const streamHeights = { live: null, episode: null };
 
-function priorityOn() { return readSetting('priority_mode') === '1'; }
-// The mode the CURRENT live session was started in ('full' | 'priority'),
-// recorded by the webhook when OME asks how to build it.
-function liveRunMode() { return readSetting('live_run_mode') === 'priority' ? 'priority' : 'full'; }
-
-// Which quality playlists actually exist right now for a channel.
 function availableQualityKeys(channel) {
-  const all = Object.keys(STREAM_QUALITY_FILES);
-  if (channel === 'episode') return all;
-  const mode = streamStates.live.live ? liveRunMode() : (priorityOn() ? 'priority' : 'full');
-  return mode === 'priority' ? PRIORITY_QUALITY_KEYS : all;
-}
-
-function updatePriorityFlag(episode) {
-  if (!episode) return; // episode poll failed - leave the flag as it was
-  if (episode.live) {
-    episodeOfflineSince = null;
-    if (!priorityOn()) {
-      writeSetting('priority_mode', '1');
-      console.log('[Priority] Episode is live - /live drops 720p (keeps 1080p/480p/360p).');
-    }
-  } else if (priorityOn()) {
-    if (episodeOfflineSince === null) episodeOfflineSince = Date.now();
-    else if (Date.now() - episodeOfflineSince >= PRIORITY_IDLE_MS) {
-      writeSetting('priority_mode', '0');
-      episodeOfflineSince = null;
-      console.log('[Priority] Episode has been off for 3 min - /live gets its full ladder back.');
-    }
+  const h = streamHeights[channel];
+  if (h) {
+    return Object.keys(STREAM_QUALITY_FILES).filter(k =>
+      k === 'auto' || k === 'q1080' || h.includes(Number(k.slice(1))));
   }
+  return channel === 'live' ? LIVE_QUALITY_KEYS : Object.keys(STREAM_QUALITY_FILES);
 }
 
-async function reconcileLiveMode(liveRes) {
-  // Only once the webhook has proven itself (OME called it at least once):
-  // without it, a disconnect could never change the mode and would just
-  // knock /live offline for nothing.
-  if (readSetting('webhook_seen') !== '1') return;
-  if (!liveRes || !liveRes.live || !liveRes.inputName) { failedPrioritySwitches = 0; return; }
-  const want = priorityOn() ? 'priority' : 'full';
-  if (liveRunMode() === want) { failedPrioritySwitches = 0; return; }
-  if (Date.now() - lastPrioritySwitchAt < PRIORITY_SWITCH_COOLDOWN_MS) return;
-  if (failedPrioritySwitches >= PRIORITY_MAX_FAILED_SWITCHES) return;
-  lastPrioritySwitchAt = Date.now();
-  failedPrioritySwitches++;
-  try {
-    await omeApiDelete(`${OME_APPS_URL}/app/streams/${encodeURIComponent(liveRes.inputName)}`);
-    console.log(`[Priority] Disconnected the live input so it restarts in "${want}" mode (was "${liveRunMode()}").`);
-  } catch (err) {
-    console.error('[Priority] Could not disconnect the live input:', err.message || err);
+// ---------- "Episode is starting" banner ----------
+// Live viewers get a short-lived banner when the episode goes on air (after
+// it has been off for a while, so an OBS reconnect doesn't repeat it). It is
+// sent over the socket to people already on the live page, and to anyone who
+// opens it within the next minute; after that it is simply gone.
+const EPISODE_BANNER_MS = 60 * 1000;
+const EPISODE_BANNER_MIN_OFFLINE_MS = 3 * 60 * 1000;
+let episodeOfflineSince = null;
+let episodeBannerAt = 0;
+
+function trackEpisodeStart(ep) {
+  if (!ep) return; // episode poll failed - leave things as they are
+  if (!ep.live) {
+    if (episodeOfflineSince === null) episodeOfflineSince = Date.now();
+    return;
+  }
+  const wasOffLongEnough = episodeOfflineSince !== null && Date.now() - episodeOfflineSince >= EPISODE_BANNER_MIN_OFFLINE_MS;
+  episodeOfflineSince = null;
+  if (wasOffLongEnough) {
+    episodeBannerAt = Date.now();
+    io.to(roomOf('live')).emit('episode_started', { ms: EPISODE_BANNER_MS });
+    console.log('[Episode] Episode is on air - banner sent to live viewers.');
   }
 }
 
@@ -641,12 +606,10 @@ async function pollStreamLive() {
       }
     }));
 
-    if (results.live && results.live.live && results.live.runMode && results.live.runMode !== liveRunMode()) {
-      console.log(`[Priority] Live is actually running in "${results.live.runMode}" mode (was recorded as "${liveRunMode()}") - corrected.`);
-      writeSetting('live_run_mode', results.live.runMode);
+    for (const ch of CHANNELS) {
+      if (results[ch]) streamHeights[ch] = results[ch].live ? results[ch].heights : null;
     }
-    updatePriorityFlag(results.episode);
-    await reconcileLiveMode(results.live);
+    trackEpisodeStart(results.episode);
 
     // A new session on EITHER channel needs one purge. Session ids are
     // persisted, so a backend restart doesn't re-purge a stream that was
@@ -672,11 +635,8 @@ async function pollStreamLive() {
       const r = results[ch];
       if (!r) continue;
       const prev = streamStates[ch];
-      // Live viewers also learn whether the episode currently has priority,
-      // so their page can explain the reduced quality list.
-      const priority = ch === 'live' ? priorityOn() : false;
-      const changed = prev.live !== r.live || prev.sessionId !== r.sessionId || prev.priority !== priority;
-      streamStates[ch] = { live: r.live, sessionId: r.sessionId, priority };
+      const changed = prev.live !== r.live || prev.sessionId !== r.sessionId;
+      streamStates[ch] = { live: r.live, sessionId: r.sessionId };
       if (changed) io.to(roomOf(ch)).emit('stream_state', streamStates[ch]);
     }
   } catch (err) {
@@ -695,10 +655,9 @@ setInterval(pollStreamLive, STREAM_POLL_INTERVAL_MS);
 // container itself - so this listener binds to the bridge gateway address
 // (172.17.0.1, reachable only from this machine and its containers, never
 // from the internet), separate from the public app on 127.0.0.1:4000.
-//   episode          -> answer "allowed: false" = OME builds its own local
-//                       profiles from Server.xml (the full ladder).
-//   live, normal     -> same.
-//   live, priority   -> 1080p (bypass) + 480p + 360p, no 720p.
+//   episode  -> answer "allowed: false" = OME builds its own local profiles
+//               from Server.xml (the full ladder: 1080/720/480/360).
+//   live     -> 1080p (bypass) + 720p + 360p, always (no 480p).
 // Anything going wrong (this listener down, slow, or erroring) makes OME fall
 // back to its local full ladder (UseLocalProfilesOn* in Server.xml), so a
 // stream can never fail to start because of the webhook.
@@ -707,12 +666,9 @@ const WEBHOOK_PORT = Number(process.env.OME_WEBHOOK_PORT || 4001);
 const WEBHOOK_SECRET = process.env.OME_WEBHOOK_SECRET || '';
 let webhookRequestsLogged = 0;
 
-// Live while the episode is on: the original 1080p plus 480p and 360p. Only
-// 720p - the most expensive transcode by far - is dropped. Encoder settings
-// match the local profiles in Server.xml exactly.
-const PRIORITY_QUALITY_KEYS = ['auto', 'q1080', 'q480', 'q360'];
-
-function buildPriorityProfiles() {
+// Live: the original 1080p plus 720p and 360p. Encoder settings match the
+// local profiles in Server.xml exactly - only 480p is left out.
+function buildLiveProfiles() {
   const x264 = (name, bitrate, width, height) => ({
     name, codec: 'h264', bitrate, framerate: 30, width, height, preset: 'faster', profile: 'main', modules: 'x264'
   });
@@ -725,18 +681,18 @@ function buildPriorityProfiles() {
       name: 'bypass_stream',
       outputStreamName: 'stream',
       encodes: {
-        videos: [{ name: 'bypass_video', bypass: true }, x264('video_480p', 1200000, 854, 480), x264('video_360p', 600000, 640, 360)],
+        videos: [{ name: 'bypass_video', bypass: true }, x264('video_720p', 2500000, 1280, 720), x264('video_360p', 600000, 640, 360)],
         audios: [{ name: 'aac_audio', codec: 'aac', bitrate: 128000, samplerate: 48000, channel: 2, bypassIfMatch: { codec: 'eq' } }]
       },
       playlists: [
         { name: 'default', fileName: 'llhls', options: { hlsChunklistPathDepth: 0, enableTsPackaging: true },
           renditions: [
             { name: '1080p', video: 'bypass_video', audio: 'aac_audio' },
-            { name: '480p', video: 'video_480p', audio: 'aac_audio' },
+            { name: '720p', video: 'video_720p', audio: 'aac_audio' },
             { name: '360p', video: 'video_360p', audio: 'aac_audio' }
           ] },
         single('1080p only', 'q1080', 'bypass_video'),
-        single('480p only', 'q480', 'video_480p'),
+        single('720p only', 'q720', 'video_720p'),
         single('360p only', 'q360', 'video_360p')
       ]
     }]
@@ -765,10 +721,8 @@ webhookApp.post('/internal/ome/transcode', express.raw({ type: '*/*', limit: '25
     writeSetting('webhook_seen', '1');
 
     if (omeApp === 'app') {
-      const mode = priorityOn() ? 'priority' : 'full';
-      writeSetting('live_run_mode', mode);
-      console.log(`[Webhook] live stream starting in "${mode}" mode.`);
-      if (mode === 'priority') return res.json({ allowed: true, reason: 'episode has priority', outputProfiles: buildPriorityProfiles() });
+      console.log('[Webhook] live stream starting with 1080p/720p/360p.');
+      return res.json({ allowed: true, reason: 'live ladder', outputProfiles: buildLiveProfiles() });
     } else if (omeApp === 'episode') {
       console.log('[Webhook] episode stream starting with the full ladder.');
     }
@@ -1030,6 +984,11 @@ io.on('connection', (socket) => {
   // down (backgrounded tab, network drop) - it compares this sessionId with
   // the one it's playing and rebuilds if they differ.
   if (streamStates[channel].live !== null) socket.emit('stream_state', streamStates[channel]);
+  // Opened the live page within a minute of the episode starting: show the
+  // banner for whatever is left of that minute.
+  if (channel === 'live' && Date.now() - episodeBannerAt < EPISODE_BANNER_MS) {
+    socket.emit('episode_started', { ms: EPISODE_BANNER_MS - (Date.now() - episodeBannerAt) });
+  }
 
   socket.on('disconnect', () => {
     if (presenceUserId) {
