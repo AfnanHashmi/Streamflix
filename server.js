@@ -331,6 +331,35 @@ try {
 } catch (e) {}
 db.exec(`CREATE INDEX IF NOT EXISTS idx_polls_status ON polls(status)`);
 
+// Library: a folder is either 'drive' (Google Drive embeds, the original and
+// default) or 'r2' (private files in the Cloudflare R2 bucket, served by the
+// media Worker). Existing folders/videos keep the 'drive' default untouched.
+try { db.exec(`ALTER TABLE library_folders ADD COLUMN storage TEXT NOT NULL DEFAULT 'drive'`); } catch (e) {}
+try { db.exec(`ALTER TABLE library_videos ADD COLUMN r2_key TEXT`); } catch (e) {}
+try { db.exec(`ALTER TABLE library_videos ADD COLUMN size_bytes INTEGER`); } catch (e) {}
+// One row per "watch" (a player session) of an R2 video by a user. Times are
+// epoch milliseconds. A watch continues while last_seen_at keeps being renewed.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS library_watches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    video_id INTEGER NOT NULL,
+    started_at INTEGER NOT NULL,
+    last_seen_at INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_library_watches_uv ON library_watches(user_id, video_id);
+`);
+// The beta folder: same card (image + description) as "24Hrs Channel BB20",
+// with " (Beta)" added; its videos live in R2.
+(function seedBetaFolder() {
+  const BETA_TITLE = 'BB 24Hrs Channel (Beta)';
+  if (db.prepare('SELECT 1 FROM library_folders WHERE title = ?').get(BETA_TITLE)) return;
+  const src = db.prepare(`SELECT description, thumbnail_url FROM library_folders WHERE title = '24Hrs Channel BB20'`).get();
+  db.prepare(`INSERT INTO library_folders (title, description, thumbnail_url, storage) VALUES (?, ?, ?, 'r2')`)
+    .run(BETA_TITLE, src ? src.description : '', src ? src.thumbnail_url : '');
+  console.log(`[Library] Created folder "${BETA_TITLE}" (R2).`);
+})();
+
 // Per-channel chat and polls: every row belongs to exactly one page. Existing
 // rows predate the episode page, so the DEFAULT 'live' assigns them correctly.
 try { db.exec(`ALTER TABLE chat_messages ADD COLUMN channel TEXT NOT NULL DEFAULT 'live'`); } catch (e) {}
@@ -1940,7 +1969,7 @@ app.get('/api/stream-title', (req, res) => {
 app.get('/api/library/folders', (req, res) => {
   try {
     const folders = db.prepare(`
-      SELECT f.id, f.title, f.description, f.thumbnail_url, f.created_at,
+      SELECT f.id, f.title, f.description, f.thumbnail_url, f.created_at, f.storage,
              COUNT(v.id) AS video_count
       FROM library_folders f
       LEFT JOIN library_videos v ON v.folder_id = f.id
@@ -1983,6 +2012,7 @@ app.post('/api/library/folders', requireAuth, requireAdmin, (req, res) => {
 app.delete('/api/library/folders/:id', requireAuth, requireAdmin, (req, res) => {
   try {
     const folderId = req.params.id;
+    db.prepare('DELETE FROM library_watches WHERE video_id IN (SELECT id FROM library_videos WHERE folder_id = ?)').run(folderId);
     db.prepare('DELETE FROM library_videos WHERE folder_id = ?').run(folderId);
     const info = db.prepare('DELETE FROM library_folders WHERE id = ?').run(folderId);
     if (info.changes === 0) return res.status(404).json({ error: 'Folder not found' });
@@ -2000,7 +2030,24 @@ app.get('/api/library/folders/:folderId/videos', (req, res) => {
     const folder = db.prepare('SELECT * FROM library_folders WHERE id = ?').get(folderId);
     if (!folder) return res.status(404).json({ error: 'Folder not found' });
 
-    const videos = db.prepare('SELECT * FROM library_videos WHERE folder_id = ? ORDER BY id DESC').all(folderId);
+    let videos = db.prepare('SELECT * FROM library_videos WHERE folder_id = ? ORDER BY id DESC').all(folderId);
+    if (folder.storage === 'r2') {
+      // The bucket file name is never sent to browsers (playback goes through
+      // signed passes). Logged-in viewers also get their own watch counts.
+      const userId = optionalUserId(req);
+      const used = userId
+        ? Object.fromEntries(db.prepare(`
+            SELECT video_id, COUNT(*) AS n FROM library_watches WHERE user_id = ? GROUP BY video_id
+          `).all(userId).map(r => [r.video_id, r.n]))
+        : {};
+      videos = videos.map(({ r2_key, video_url, drive_id, ...v }) => ({
+        ...v,
+        storage: 'r2',
+        watchesUsed: used[v.id] || 0,
+        watchesLeft: Math.max(0, R2_WATCH_LIMIT - (used[v.id] || 0)),
+        watchLimit: R2_WATCH_LIMIT
+      }));
+    }
     res.json({ folder, videos });
   } catch (err) {
     console.error('Fetch videos error:', err);
@@ -2012,6 +2059,8 @@ app.get('/api/library/folders/:folderId/videos', (req, res) => {
 app.post('/api/library/videos', requireAuth, requireAdmin, (req, res) => {
   try {
     const { folder_id, title, video_url, description } = req.body || {};
+    const targetFolder = db.prepare('SELECT storage FROM library_folders WHERE id = ?').get(folder_id);
+    if (targetFolder && targetFolder.storage === 'r2') return addR2Video(req, res);
     if (!folder_id || !title || !title.trim() || !video_url || !video_url.trim()) {
       return res.status(400).json({ error: 'Folder ID, video title, and video URL are required' });
     }
@@ -2048,6 +2097,7 @@ app.post('/api/library/videos', requireAuth, requireAdmin, (req, res) => {
 app.delete('/api/library/videos/:id', requireAuth, requireAdmin, (req, res) => {
   try {
     const videoId = req.params.id;
+    db.prepare('DELETE FROM library_watches WHERE video_id = ?').run(videoId);
     const info = db.prepare('DELETE FROM library_videos WHERE id = ?').run(videoId);
     if (info.changes === 0) return res.status(404).json({ error: 'Video not found' });
     res.json({ success: true });
@@ -2055,6 +2105,183 @@ app.delete('/api/library/videos/:id', requireAuth, requireAdmin, (req, res) => {
     console.error('Delete video error:', err);
     res.status(500).json({ error: 'Failed to delete video' });
   }
+});
+
+// ---------- Library: R2 videos (two watches, then download-only) ----------
+// Files sit in a private R2 bucket and are served only by the media Worker
+// (media.biggboss24hrs.com), which needs a pass signed here:
+//   watch pass    cookie sf_w_<videoId>, 2 min, renewed by a heartbeat while
+//                 the player is open - so a watch ends ~2 min after the
+//                 player is closed, and reopening within that window
+//                 continues the SAME watch (grace for refresh / phone lock).
+//   download link one-off URL, 10 min, whole file as an attachment.
+// Each user gets R2_WATCH_LIMIT watches per video; after that the video is
+// download-only. Admins are exempt (so testing never locks the owner out).
+// Everything sits behind login + the rotating access link (gateStream).
+const R2_WATCH_LIMIT = 2;
+const R2_WATCH_GRACE_MS = 2 * 60 * 1000;
+const R2_DOWNLOAD_TTL_MS = 10 * 60 * 1000;
+const MEDIA_ORIGIN = process.env.MEDIA_ORIGIN || 'https://media.biggboss24hrs.com';
+
+function signMediaPass(payload) {
+  const body = Buffer.from(JSON.stringify(payload)).toString('base64url');
+  const sig = crypto.createHmac('sha256', process.env.MEDIA_SIGNING_SECRET).update(body).digest('base64url');
+  return `${body}.${sig}`;
+}
+
+function isAdminUser(user) { return user?.role === 'admin' || !!user?.isAdmin; }
+
+// Lists bucket objects through the Cloudflare API (prefix + exact-match is
+// how a file's existence/size is checked - no S3 signing needed here).
+async function r2ListObjects(prefix, perPage = 200) {
+  const url = `https://api.cloudflare.com/client/v4/accounts/${process.env.R2_ACCOUNT_ID}/r2/buckets/${process.env.R2_BUCKET}/objects`
+    + `?per_page=${perPage}` + (prefix ? `&prefix=${encodeURIComponent(prefix)}` : '');
+  const res = await fetch(url, {
+    headers: { Authorization: `Bearer ${process.env.CLOUDFLARE_R2_TOKEN}` },
+    signal: AbortSignal.timeout(10000)
+  });
+  const json = await res.json().catch(() => ({}));
+  if (!json.success) throw new Error('R2 list failed: ' + JSON.stringify(json.errors || res.status));
+  return json.result || [];
+}
+
+function setWatchCookie(res, videoId, key, userId) {
+  const exp = Date.now() + R2_WATCH_GRACE_MS;
+  const opts = { httpOnly: true, secure: IS_PROD, path: '/v/', sameSite: 'lax', maxAge: R2_WATCH_GRACE_MS };
+  if (IS_PROD) opts.domain = COOKIE_DOMAIN;
+  res.cookie(`sf_w_${videoId}`, signMediaPass({ u: userId, k: key, v: videoId, exp }), opts);
+}
+
+function clearWatchCookie(res, videoId) {
+  const opts = { path: '/v/' };
+  if (IS_PROD) opts.domain = COOKIE_DOMAIN;
+  res.clearCookie(`sf_w_${videoId}`, opts);
+}
+
+function getR2Video(videoId) {
+  return db.prepare(`
+    SELECT v.id, v.title, v.r2_key, f.storage
+    FROM library_videos v JOIN library_folders f ON f.id = v.folder_id
+    WHERE v.id = ?
+  `).get(videoId);
+}
+
+const r2Limiter = makeLimiter(15 * 60 * 1000, 200, 'Too many requests. Please try again in a few minutes.');
+
+// Admin: pick a file already uploaded to the bucket (the add-video form
+// shows this list, so file names never have to be typed).
+app.get('/api/library/r2/objects', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const used = new Set(db.prepare('SELECT r2_key FROM library_videos WHERE r2_key IS NOT NULL').all().map(r => r.r2_key));
+    const objects = (await r2ListObjects('', 500))
+      .filter(o => o.size > 0 && /\.(mp4|m4v|mov|webm)$/i.test(o.key))
+      .map(o => ({ key: o.key, size: o.size, modified: o.last_modified, used: used.has(o.key) }));
+    res.json({ objects });
+  } catch (err) {
+    console.error('[R2] list error:', err.message || err);
+    res.status(502).json({ error: 'Could not list the bucket' });
+  }
+});
+
+async function addR2Video(req, res) {
+  try {
+    const { folder_id, title, description, r2_key } = req.body || {};
+    const cleanTitle = String(title || '').trim();
+    const key = String(r2_key || '').trim();
+    if (!folder_id || !cleanTitle || !key) {
+      return res.status(400).json({ error: 'Folder, title and a bucket file are required' });
+    }
+    if (db.prepare('SELECT 1 FROM library_videos WHERE r2_key = ?').get(key)) {
+      return res.status(409).json({ error: 'That file is already added' });
+    }
+    const found = (await r2ListObjects(key, 10)).find(o => o.key === key);
+    if (!found) return res.status(404).json({ error: 'That file is not in the bucket' });
+
+    const info = db.prepare(`
+      INSERT INTO library_videos (folder_id, title, video_url, drive_id, description, r2_key, size_bytes)
+      VALUES (?, ?, ?, NULL, ?, ?, ?)
+    `).run(folder_id, cleanTitle, `r2:${key}`, String(description || '').trim(), key, found.size);
+    res.json({ success: true, video: { id: info.lastInsertRowid, folder_id, title: cleanTitle, size_bytes: found.size, storage: 'r2' } });
+  } catch (err) {
+    console.error('[R2] add video error:', err.message || err);
+    res.status(500).json({ error: 'Failed to add video' });
+  }
+}
+
+// Start or continue a watch. Counts a new watch only when no watch of this
+// video by this user was alive within the last 2 minutes.
+app.post('/api/library/r2/:videoId/watch', r2Limiter, requireAuth, gateStream, (req, res) => {
+  const video = getR2Video(Number(req.params.videoId));
+  if (!video || video.storage !== 'r2' || !video.r2_key) return res.status(404).json({ error: 'Video not found' });
+  const userId = req.user.id, now = Date.now(), admin = isAdminUser(req.user);
+
+  const last = db.prepare('SELECT * FROM library_watches WHERE user_id = ? AND video_id = ? ORDER BY id DESC LIMIT 1').get(userId, video.id);
+  const count = db.prepare('SELECT COUNT(*) AS n FROM library_watches WHERE user_id = ? AND video_id = ?').get(userId, video.id).n;
+
+  if (!admin) {
+    if (last && now - last.last_seen_at <= R2_WATCH_GRACE_MS) {
+      db.prepare('UPDATE library_watches SET last_seen_at = ? WHERE id = ?').run(now, last.id);
+    } else if (count >= R2_WATCH_LIMIT) {
+      return res.status(403).json({ downloadOnly: true, watchesUsed: count, watchLimit: R2_WATCH_LIMIT });
+    } else {
+      db.prepare('INSERT INTO library_watches (user_id, video_id, started_at, last_seen_at) VALUES (?, ?, ?, ?)').run(userId, video.id, now, now);
+    }
+  }
+  const used = admin ? 0 : db.prepare('SELECT COUNT(*) AS n FROM library_watches WHERE user_id = ? AND video_id = ?').get(userId, video.id).n;
+  setWatchCookie(res, video.id, video.r2_key, userId);
+  res.json({
+    ok: true,
+    src: `${MEDIA_ORIGIN}/v/${video.id}`,
+    watchesUsed: used,
+    watchesLeft: admin ? null : Math.max(0, R2_WATCH_LIMIT - used),
+    watchLimit: R2_WATCH_LIMIT,
+    heartbeatMs: 45 * 1000
+  });
+});
+
+// Renews the pass while the player is open. Past the 2-minute window (a
+// suspended tab, a lost connection) it refuses, and the page asks /watch
+// again - which then counts as a new watch, or turns download-only.
+app.post('/api/library/r2/:videoId/heartbeat', requireAuth, gateStream, (req, res) => {
+  const video = getR2Video(Number(req.params.videoId));
+  if (!video || video.storage !== 'r2' || !video.r2_key) return res.status(404).json({ error: 'Video not found' });
+  const userId = req.user.id, now = Date.now();
+  if (!isAdminUser(req.user)) {
+    const last = db.prepare('SELECT * FROM library_watches WHERE user_id = ? AND video_id = ? ORDER BY id DESC LIMIT 1').get(userId, video.id);
+    if (!last || now - last.last_seen_at > R2_WATCH_GRACE_MS) return res.status(410).json({ expired: true });
+    db.prepare('UPDATE library_watches SET last_seen_at = ? WHERE id = ?').run(now, last.id);
+  }
+  setWatchCookie(res, video.id, video.r2_key, userId);
+  res.json({ ok: true });
+});
+
+// Player closed: drop the pass now. last_seen_at is set to "now" so the
+// 2-minute reopen window counts from the moment the viewer closed it.
+app.post('/api/library/r2/:videoId/close', requireAuth, (req, res) => {
+  const videoId = Number(req.params.videoId);
+  if (!isAdminUser(req.user)) {
+    const last = db.prepare('SELECT * FROM library_watches WHERE user_id = ? AND video_id = ? ORDER BY id DESC LIMIT 1').get(req.user.id, videoId);
+    if (last && Date.now() - last.last_seen_at <= R2_WATCH_GRACE_MS) {
+      db.prepare('UPDATE library_watches SET last_seen_at = ? WHERE id = ?').run(Date.now(), last.id);
+    }
+  }
+  clearWatchCookie(res, videoId);
+  res.json({ ok: true });
+});
+
+// Download link - only once the watches are used up (admins any time).
+app.post('/api/library/r2/:videoId/download', r2Limiter, requireAuth, gateStream, (req, res) => {
+  const video = getR2Video(Number(req.params.videoId));
+  if (!video || video.storage !== 'r2' || !video.r2_key) return res.status(404).json({ error: 'Video not found' });
+  const count = db.prepare('SELECT COUNT(*) AS n FROM library_watches WHERE user_id = ? AND video_id = ?').get(req.user.id, video.id).n;
+  if (!isAdminUser(req.user) && count < R2_WATCH_LIMIT) {
+    return res.status(403).json({ error: 'Downloads unlock after your watches are used', watchesUsed: count, watchLimit: R2_WATCH_LIMIT });
+  }
+  const token = signMediaPass({
+    u: req.user.id, k: video.r2_key, v: video.id, exp: Date.now() + R2_DOWNLOAD_TTL_MS,
+    n: `${video.title}.mp4`, dl: 1
+  });
+  res.json({ url: `${MEDIA_ORIGIN}/d/${video.id}?t=${token}` });
 });
 
 // ---------- Live Polls & Predictions ----------
