@@ -355,10 +355,17 @@ db.exec(`
   const BETA_TITLE = 'BB 24Hrs Channel (Beta)';
   if (db.prepare('SELECT 1 FROM library_folders WHERE title = ?').get(BETA_TITLE)) return;
   const src = db.prepare(`SELECT description, thumbnail_url FROM library_folders WHERE title = '24Hrs Channel BB20'`).get();
-  db.prepare(`INSERT INTO library_folders (title, description, thumbnail_url, storage) VALUES (?, ?, ?, 'r2')`)
+  db.prepare(`INSERT INTO library_folders (title, description, thumbnail_url, storage, naming) VALUES (?, ?, ?, 'r2', 'livefeed')`)
     .run(BETA_TITLE, src ? src.description : '', src ? src.thumbnail_url : '');
   console.log(`[Library] Created folder "${BETA_TITLE}" (R2).`);
 })();
+
+// Title helper per folder for the admin add/rename form: 'episode'
+// ("Episode 27 (WKW Saturday)"), 'livefeed' ("Live Feed 1stOct2026 10:00 -
+// 01:00(next day)") or NULL (custom name only). A custom name is always allowed.
+try { db.exec(`ALTER TABLE library_folders ADD COLUMN naming TEXT`); } catch (e) {}
+db.prepare(`UPDATE library_folders SET naming = 'episode' WHERE naming IS NULL AND title = 'Bigg Boss 20'`).run();
+db.prepare(`UPDATE library_folders SET naming = 'livefeed' WHERE naming IS NULL AND title = 'BB 24Hrs Channel (Beta)'`).run();
 
 // Per-channel chat and polls: every row belongs to exactly one page. Existing
 // rows predate the episode page, so the DEFAULT 'live' assigns them correctly.
@@ -1969,7 +1976,7 @@ app.get('/api/stream-title', (req, res) => {
 app.get('/api/library/folders', (req, res) => {
   try {
     const folders = db.prepare(`
-      SELECT f.id, f.title, f.description, f.thumbnail_url, f.created_at, f.storage,
+      SELECT f.id, f.title, f.description, f.thumbnail_url, f.created_at, f.storage, f.naming,
              COUNT(v.id) AS video_count
       FROM library_folders f
       LEFT JOIN library_videos v ON v.folder_id = f.id
@@ -2093,6 +2100,20 @@ app.post('/api/library/videos', requireAuth, requireAdmin, (req, res) => {
   }
 });
 
+// PATCH /api/library/videos/:id (Admin only) - rename; changes the title only.
+app.patch('/api/library/videos/:id', requireAuth, requireAdmin, (req, res) => {
+  try {
+    const title = String((req.body || {}).title || '').trim();
+    if (!title || title.length > 200) return res.status(400).json({ error: 'Title must be 1-200 characters' });
+    const info = db.prepare('UPDATE library_videos SET title = ? WHERE id = ?').run(title, req.params.id);
+    if (info.changes === 0) return res.status(404).json({ error: 'Video not found' });
+    res.json({ success: true, title });
+  } catch (err) {
+    console.error('Rename video error:', err);
+    res.status(500).json({ error: 'Failed to rename video' });
+  }
+});
+
 // DELETE /api/library/videos/:id (Admin only)
 app.delete('/api/library/videos/:id', requireAuth, requireAdmin, (req, res) => {
   try {
@@ -2130,6 +2151,17 @@ function signMediaPass(payload) {
 }
 
 function isAdminUser(user) { return user?.role === 'admin' || !!user?.isAdmin; }
+
+// Apple's media engine (every browser on iPhone/iPad, and Safari on Mac)
+// can't start the long single-file MP4s in R2 - the 13.6h file's 61.7 MB index
+// is fetched in many small requests and playback never begins. Those devices
+// get download-only, without using watches. The page applies the same rule.
+// A spoofed user agent can reach the download early (accepted by the owner).
+function isApplePlayback(ua) {
+  ua = String(ua || '');
+  if (/iPhone|iPad|iPod/.test(ua)) return true;
+  return /Macintosh/.test(ua) && /Safari/.test(ua) && !/Chrome|Chromium|CriOS|FxiOS|Firefox|Edg|OPR/.test(ua);
+}
 
 // Lists bucket objects through the Cloudflare API (prefix + exact-match is
 // how a file's existence/size is checked - no S3 signing needed here).
@@ -2274,7 +2306,7 @@ app.post('/api/library/r2/:videoId/download', r2Limiter, requireAuth, gateStream
   const video = getR2Video(Number(req.params.videoId));
   if (!video || video.storage !== 'r2' || !video.r2_key) return res.status(404).json({ error: 'Video not found' });
   const count = db.prepare('SELECT COUNT(*) AS n FROM library_watches WHERE user_id = ? AND video_id = ?').get(req.user.id, video.id).n;
-  if (!isAdminUser(req.user) && count < R2_WATCH_LIMIT) {
+  if (!isAdminUser(req.user) && count < R2_WATCH_LIMIT && !isApplePlayback(req.headers['user-agent'])) {
     return res.status(403).json({ error: 'Downloads unlock after your watches are used', watchesUsed: count, watchLimit: R2_WATCH_LIMIT });
   }
   const token = signMediaPass({
