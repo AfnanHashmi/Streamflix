@@ -337,6 +337,9 @@ db.exec(`CREATE INDEX IF NOT EXISTS idx_polls_status ON polls(status)`);
 try { db.exec(`ALTER TABLE library_folders ADD COLUMN storage TEXT NOT NULL DEFAULT 'drive'`); } catch (e) {}
 try { db.exec(`ALTER TABLE library_videos ADD COLUMN r2_key TEXT`); } catch (e) {}
 try { db.exec(`ALTER TABLE library_videos ADD COLUMN size_bytes INTEGER`); } catch (e) {}
+// Card image for R2 videos (Drive videos get theirs from Google): a frame
+// grabbed from the video itself, saved under /library/thumbs/.
+try { db.exec(`ALTER TABLE library_videos ADD COLUMN thumbnail_url TEXT`); } catch (e) {}
 // One row per "watch" (a player session) of an R2 video by a user. Times are
 // epoch milliseconds. A watch continues while last_seen_at keeps being renewed.
 db.exec(`
@@ -2120,6 +2123,7 @@ app.delete('/api/library/videos/:id', requireAuth, requireAdmin, (req, res) => {
     const videoId = req.params.id;
     db.prepare('DELETE FROM library_watches WHERE video_id = ?').run(videoId);
     const info = db.prepare('DELETE FROM library_videos WHERE id = ?').run(videoId);
+    fs.unlink(path.join(THUMB_DIR, `r2-${Number(videoId)}.jpg`), () => {});
     if (info.changes === 0) return res.status(404).json({ error: 'Video not found' });
     res.json({ success: true });
   } catch (err) {
@@ -2198,6 +2202,62 @@ function getR2Video(videoId) {
   `).get(videoId);
 }
 
+// ---- R2 thumbnails ----
+// ffmpeg reads the file through the media Worker with a short-lived pass,
+// grabs the first frame (or the frame at 5s if the first is near-black, as
+// a recording can start on black), scales it to 640px wide and saves a JPG
+// that express.static serves. Generated once per video, one at a time.
+const THUMB_DIR = '/var/www/streamflix/library/thumbs';
+fs.mkdirSync(THUMB_DIR, { recursive: true });
+let thumbQueue = Promise.resolve();
+
+function runFfmpeg(args, { capture = false, timeoutMs = 60000 } = {}) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn('/usr/bin/ffmpeg', args);
+    const out = []; let err = '';
+    proc.stdout.on('data', d => { if (capture) out.push(d); });
+    proc.stderr.on('data', d => { err += d; });
+    const timer = setTimeout(() => proc.kill('SIGKILL'), timeoutMs);
+    proc.on('error', (e) => { clearTimeout(timer); reject(e); });
+    proc.on('close', (code) => {
+      clearTimeout(timer);
+      code === 0 ? resolve(Buffer.concat(out)) : reject(new Error(`ffmpeg exited ${code}: ${err.slice(-300)}`));
+    });
+  });
+}
+
+async function makeR2Thumbnail(videoId, key) {
+  const pass = signMediaPass({ u: 0, k: key, v: videoId, exp: Date.now() + 5 * 60 * 1000 });
+  const src = `${MEDIA_ORIGIN}/v/${videoId}`;
+  const tmp = path.join(THUMB_DIR, `.tmp-r2-${videoId}.jpg`);
+  const finalPath = path.join(THUMB_DIR, `r2-${videoId}.jpg`);
+  for (const at of [0, 5]) {
+    await runFfmpeg(['-loglevel', 'error', '-y', '-headers', `Cookie: sf_w_${videoId}=${pass}\r\n`,
+      '-ss', String(at), '-i', src, '-frames:v', '1', '-vf', 'scale=640:-2', '-q:v', '4', tmp]);
+    // Average brightness: shrink to one grey pixel and read its value.
+    const px = await runFfmpeg(['-loglevel', 'error', '-i', tmp, '-vf', 'scale=1:1,format=gray', '-f', 'rawvideo', '-'], { capture: true });
+    if ((px[0] ?? 255) >= 16 || at === 5) break;
+  }
+  fs.renameSync(tmp, finalPath);
+  const url = `/library/thumbs/r2-${videoId}.jpg?v=${Date.now()}`;
+  db.prepare('UPDATE library_videos SET thumbnail_url = ? WHERE id = ?').run(url, videoId);
+  console.log(`[R2] Thumbnail made for video ${videoId}.`);
+}
+
+function queueR2Thumbnail(videoId, key) {
+  thumbQueue = thumbQueue
+    .then(() => makeR2Thumbnail(videoId, key))
+    .catch(err => console.error(`[R2] Thumbnail for video ${videoId} failed:`, err.message || err));
+  return thumbQueue;
+}
+
+// Backfill: R2 videos added before thumbnails existed (or whose grab failed).
+setTimeout(() => {
+  for (const v of db.prepare('SELECT id, r2_key FROM library_videos WHERE r2_key IS NOT NULL AND thumbnail_url IS NULL').all()) {
+    queueR2Thumbnail(v.id, v.r2_key);
+  }
+}, 10 * 1000);
+
 const r2Limiter = makeLimiter(15 * 60 * 1000, 200, 'Too many requests. Please try again in a few minutes.');
 
 // Admin: pick a file already uploaded to the bucket (the add-video form
@@ -2233,6 +2293,7 @@ async function addR2Video(req, res) {
       INSERT INTO library_videos (folder_id, title, video_url, drive_id, description, r2_key, size_bytes)
       VALUES (?, ?, ?, NULL, ?, ?, ?)
     `).run(folder_id, cleanTitle, `r2:${key}`, String(description || '').trim(), key, found.size);
+    queueR2Thumbnail(Number(info.lastInsertRowid), key);
     res.json({ success: true, video: { id: info.lastInsertRowid, folder_id, title: cleanTitle, size_bytes: found.size, storage: 'r2' } });
   } catch (err) {
     console.error('[R2] add video error:', err.message || err);
