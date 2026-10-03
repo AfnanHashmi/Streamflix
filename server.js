@@ -340,6 +340,25 @@ try { db.exec(`ALTER TABLE library_videos ADD COLUMN size_bytes INTEGER`); } cat
 // Card image for R2 videos (Drive videos get theirs from Google): a frame
 // grabbed from the video itself, saved under /library/thumbs/.
 try { db.exec(`ALTER TABLE library_videos ADD COLUMN thumbnail_url TEXT`); } catch (e) {}
+// When the video was recorded (from its file name) - R2 folders list newest
+// recording first, whatever order the cards were added in.
+try { db.exec(`ALTER TABLE library_videos ADD COLUMN sort_at TEXT`); } catch (e) {}
+
+// "2026-09-06 23-55-54.mp4" or "stream_20260911031543_...mp4" -> "YYYY-MM-DD HH:MM:SS".
+// A name with only a date ("2026-10-01.mp4") gets 00:00:00. Unrecognised -> null.
+function recordingTimeFromKey(key) {
+  const base = String(key || '').split('/').pop();
+  let m = base.match(/(\d{4})-(\d{2})-(\d{2})[ _T](\d{2})-(\d{2})-(\d{2})/);
+  if (m) return `${m[1]}-${m[2]}-${m[3]} ${m[4]}:${m[5]}:${m[6]}`;
+  m = base.match(/stream_(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})/);
+  if (m) return `${m[1]}-${m[2]}-${m[3]} ${m[4]}:${m[5]}:${m[6]}`;
+  m = base.match(/^(\d{4})-(\d{2})-(\d{2})\b/);
+  return m ? `${m[1]}-${m[2]}-${m[3]} 00:00:00` : null;
+}
+for (const v of db.prepare('SELECT id, r2_key FROM library_videos WHERE r2_key IS NOT NULL AND sort_at IS NULL').all()) {
+  const t = recordingTimeFromKey(v.r2_key);
+  if (t) db.prepare('UPDATE library_videos SET sort_at = ? WHERE id = ?').run(t, v.id);
+}
 // One row per "watch" (a player session) of an R2 video by a user. Times are
 // epoch milliseconds. A watch continues while last_seen_at keeps being renewed.
 db.exec(`
@@ -1999,7 +2018,9 @@ app.get('/api/library/folders/:folderId/videos', (req, res) => {
     const folder = db.prepare('SELECT * FROM library_folders WHERE id = ?').get(folderId);
     if (!folder) return res.status(404).json({ error: 'Folder not found' });
 
-    let videos = db.prepare('SELECT * FROM library_videos WHERE folder_id = ? ORDER BY id DESC').all(folderId);
+    let videos = db.prepare(folder.storage === 'r2'
+      ? 'SELECT * FROM library_videos WHERE folder_id = ? ORDER BY COALESCE(sort_at, created_at) DESC, id DESC'
+      : 'SELECT * FROM library_videos WHERE folder_id = ? ORDER BY id DESC').all(folderId);
     if (folder.storage === 'r2') {
       // The bucket file name is never sent to browsers (playback goes through
       // signed passes). Logged-in viewers also get their own watch counts.
@@ -2249,9 +2270,9 @@ async function addR2Video(req, res) {
     if (!found) return res.status(404).json({ error: 'That file is not in the bucket' });
 
     const info = db.prepare(`
-      INSERT INTO library_videos (folder_id, title, video_url, drive_id, description, r2_key, size_bytes)
-      VALUES (?, ?, ?, NULL, ?, ?, ?)
-    `).run(folder_id, cleanTitle, `r2:${key}`, String(description || '').trim(), key, found.size);
+      INSERT INTO library_videos (folder_id, title, video_url, drive_id, description, r2_key, size_bytes, sort_at)
+      VALUES (?, ?, ?, NULL, ?, ?, ?, ?)
+    `).run(folder_id, cleanTitle, `r2:${key}`, String(description || '').trim(), key, found.size, recordingTimeFromKey(key));
     queueR2Thumbnail(Number(info.lastInsertRowid), key);
     res.json({ success: true, video: { id: info.lastInsertRowid, folder_id, title: cleanTitle, size_bytes: found.size, storage: 'r2' } });
   } catch (err) {
