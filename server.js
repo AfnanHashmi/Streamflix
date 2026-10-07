@@ -470,8 +470,8 @@ const STREAM_POLL_INTERVAL_MS = 2000;
 // the edge before the next start. After createdTime changes, OME has wiped
 // them, and the first new segment is still ~6s away - that's the window.
 const streamStates = {
-  live: { live: null, sessionId: null },
-  episode: { live: null, sessionId: null }
+  live: { live: null, sessionId: null, obs: null },
+  episode: { live: null, sessionId: null, obs: null }
 };
 
 function sessionSettingKey(channel) {
@@ -542,26 +542,32 @@ async function purgeCloudflareCache(channels) {
 
 // One channel's current OME state. Throws on any OME error so the caller
 // leaves that channel's last known state untouched.
+//
+// Each channel is TWO OME applications: OBS publishes into "<app>_in", and the
+// permanent channel "<app>/stream" (an OME scheduled channel) shows that
+// stream while it exists and a slate while it doesn't. The channel - and so
+// its DVR - never stops, so:
+//   live = the channel exists (a player can play it; the DVR is rewindable)
+//   obs  = OBS is actually sending right now (drives "on air" status/banner)
 async function readChannelStream(channel) {
-  const base = `${OME_APPS_URL}/${CHANNEL_OME_APP[channel]}/streams`;
-  const list = await omeApiGet(base);
+  const app = CHANNEL_OME_APP[channel];
+  const base = `${OME_APPS_URL}/${app}/streams`;
+  const [inList, list] = await Promise.all([omeApiGet(`${OME_APPS_URL}/${app}_in/streams`), omeApiGet(base)]);
+  const obs = Array.isArray(inList.response) && inList.response.length > 0;
   const live = Array.isArray(list.response) && list.response.length > 0;
   let sessionId = null;
-  // The API lists INPUT names (the ingest key); the playback name is pinned
-  // to "stream" in Server.xml, so "/stream" below is the output's detail.
-  const inputName = live ? list.response[0] : null;
   let heights = null; // video heights OME is really producing, null = not known
   if (live) {
     const detail = await omeApiGet(`${base}/stream`);
     sessionId = detail?.response?.input?.createdTime || null;
     if (!sessionId) throw new Error('OME stream detail has no input.createdTime');
-    // What the stream is REALLY being built as, read from OME itself: a
+    // What the channel is REALLY being built as, read from OME itself: a
     // stream keeps the qualities it started with, so this - not a setting -
     // decides which quality choices viewers are offered.
     const h = (detail?.response?.outputs?.[0]?.tracks || []).filter(t => t.type === 'Video').map(t => t.video?.height);
     if (h.length) heights = h;
   }
-  return { live, sessionId, inputName, heights };
+  return { live, obs, sessionId, heights };
 }
 
 // ---------- Quality lists ----------
@@ -628,7 +634,7 @@ async function pollStreamLive() {
     for (const ch of CHANNELS) {
       if (results[ch]) streamHeights[ch] = results[ch].live ? results[ch].heights : null;
     }
-    trackEpisodeStart(results.episode);
+    trackEpisodeStart(results.episode ? { live: results.episode.obs } : null);
 
     // A new session on EITHER channel needs one purge. Session ids are
     // persisted, so a backend restart doesn't re-purge a stream that was
@@ -654,8 +660,8 @@ async function pollStreamLive() {
       const r = results[ch];
       if (!r) continue;
       const prev = streamStates[ch];
-      const changed = prev.live !== r.live || prev.sessionId !== r.sessionId;
-      streamStates[ch] = { live: r.live, sessionId: r.sessionId };
+      const changed = prev.live !== r.live || prev.sessionId !== r.sessionId || prev.obs !== r.obs;
+      streamStates[ch] = { live: r.live, sessionId: r.sessionId, obs: r.obs };
       if (changed) io.to(roomOf(ch)).emit('stream_state', streamStates[ch]);
     }
   } catch (err) {
@@ -1397,7 +1403,7 @@ const STREAM_URL_TTL_MS = 12 * 60 * 60 * 1000;
 // dot on the home page's Episode button; exposes nothing about viewers or URLs.
 app.get('/api/stream/status', (req, res) => {
   res.set('Cache-Control', 'no-store');
-  res.json({ live: streamStates.live.live === true, episode: streamStates.episode.live === true });
+  res.json({ live: streamStates.live.obs === true, episode: streamStates.episode.obs === true });
 });
 
 // The episode channel is under the same rotating access link as /live (Phase
