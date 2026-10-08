@@ -455,7 +455,7 @@ for (const ch of CHANNELS) {
 // is never mistaken for the stream ending (or a new one starting). Each
 // channel is polled independently - an error on one (e.g. its OME
 // application not loaded) must never stop the other.
-const OME_APPS_URL = 'http://127.0.0.1:8081/v1/vhosts/default/apps';
+const OME_APPS_URL = process.env.OME_APPS_URL || 'http://127.0.0.1:8081/v1/vhosts/default/apps';
 const STREAM_POLL_INTERVAL_MS = 2000;
 
 // OME names segments seg_<track>_<seq>_..._<fixed id>_llhls.m4s and resets
@@ -614,6 +614,52 @@ function trackEpisodeStart(ep) {
   }
 }
 
+// ---------- Retiring the idle episode channel ----------
+// The episode's permanent channel re-encodes its slate into the full ladder
+// all day (~24 points of CPU) although the episode is on for a couple of
+// hours. Once OBS has been gone from episode_in long enough for the 2-hour
+// DVR to have fully drained, the channel is retired by renaming its schedule
+// file - OME watches that folder and deletes the channel by itself (no OME
+// restart). As soon as OBS is back on episode_in the file is renamed back and
+// OME recreates the channel, straight on the live feed, within ~1-2s. The file
+// is the source of truth; only the "OBS gone since" time is kept in settings
+// so a backend restart doesn't restart the 2-hour countdown.
+const EPISODE_SCHEDULE_DIR = process.env.EPISODE_SCHEDULE_DIR || '/root/ome-config/origin_conf/schedule/episode';
+const EPISODE_SCH_ACTIVE = path.join(EPISODE_SCHEDULE_DIR, 'stream.sch');
+const EPISODE_SCH_RETIRED = EPISODE_SCH_ACTIVE + '.retired';
+const EPISODE_RETIRE_AFTER_MS = Number(process.env.EPISODE_RETIRE_AFTER_MS) || 125 * 60 * 1000;
+const EPISODE_OBS_ABSENT_KEY = 'episode_obs_absent_since';
+let episodeChannelLastError = null;
+
+function manageEpisodeChannel(ep) {
+  if (!ep) return; // episode poll failed - leave things as they are
+  try {
+    if (ep.obs) {
+      if (readSetting(EPISODE_OBS_ABSENT_KEY) !== '') writeSetting(EPISODE_OBS_ABSENT_KEY, '');
+      if (!fs.existsSync(EPISODE_SCH_ACTIVE) && fs.existsSync(EPISODE_SCH_RETIRED)) {
+        fs.renameSync(EPISODE_SCH_RETIRED, EPISODE_SCH_ACTIVE);
+        console.log('[Episode channel] revived - OBS is on episode_in');
+      }
+    } else {
+      let since = Number(readSetting(EPISODE_OBS_ABSENT_KEY)) || 0;
+      if (!since) {
+        since = Date.now();
+        writeSetting(EPISODE_OBS_ABSENT_KEY, String(since));
+      }
+      if (Date.now() - since >= EPISODE_RETIRE_AFTER_MS && fs.existsSync(EPISODE_SCH_ACTIVE)) {
+        fs.renameSync(EPISODE_SCH_ACTIVE, EPISODE_SCH_RETIRED);
+        console.log(`[Episode channel] retired - no OBS for ${Math.round((Date.now() - since) / 60000)} min`);
+      }
+    }
+    episodeChannelLastError = null;
+  } catch (err) {
+    // Retried on the next poll; logged once per distinct error, not every 2s.
+    const msg = err.message || String(err);
+    if (msg !== episodeChannelLastError) console.error('[Episode channel] error:', msg);
+    episodeChannelLastError = msg;
+  }
+}
+
 let streamPollInFlight = false;
 
 async function pollStreamLive() {
@@ -635,6 +681,7 @@ async function pollStreamLive() {
       if (results[ch]) streamHeights[ch] = results[ch].live ? results[ch].heights : null;
     }
     trackEpisodeStart(results.episode ? { live: results.episode.obs } : null);
+    manageEpisodeChannel(results.episode);
 
     // A new session on EITHER channel needs one purge. Session ids are
     // persisted, so a backend restart doesn't re-purge a stream that was
