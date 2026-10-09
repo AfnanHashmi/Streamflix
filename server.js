@@ -551,8 +551,9 @@ async function purgeCloudflareCache(channels) {
 //   obs  = OBS is actually sending right now (drives "on air" status/banner)
 // Channels OBS publishes into directly (the original single-application setup:
 // no "<app>_in" intake, no permanent channel). There "live" and "obs" are the
-// same thing. The episode went back to this on 2026-10-08.
-const DIRECT_INGEST_CHANNELS = new Set(['episode']);
+// same thing. The episode went back to this on 2026-10-08, live on 2026-10-09
+// (a 1 s OBS blip made the relay desync live's audio and froze players).
+const DIRECT_INGEST_CHANNELS = new Set(['live', 'episode']);
 async function readChannelStream(channel) {
   const app = CHANNEL_OME_APP[channel];
   const base = `${OME_APPS_URL}/${app}/streams`;
