@@ -549,12 +549,17 @@ async function purgeCloudflareCache(channels) {
 // its DVR - never stops, so:
 //   live = the channel exists (a player can play it; the DVR is rewindable)
 //   obs  = OBS is actually sending right now (drives "on air" status/banner)
+// Channels OBS publishes into directly (the original single-application setup:
+// no "<app>_in" intake, no permanent channel). There "live" and "obs" are the
+// same thing. The episode went back to this on 2026-10-08.
+const DIRECT_INGEST_CHANNELS = new Set(['episode']);
 async function readChannelStream(channel) {
   const app = CHANNEL_OME_APP[channel];
   const base = `${OME_APPS_URL}/${app}/streams`;
-  const [inList, list] = await Promise.all([omeApiGet(`${OME_APPS_URL}/${app}_in/streams`), omeApiGet(base)]);
-  const obs = Array.isArray(inList.response) && inList.response.length > 0;
+  const direct = DIRECT_INGEST_CHANNELS.has(channel);
+  const [inList, list] = await Promise.all([direct ? null : omeApiGet(`${OME_APPS_URL}/${app}_in/streams`), omeApiGet(base)]);
   const live = Array.isArray(list.response) && list.response.length > 0;
+  const obs = direct ? live : Array.isArray(inList.response) && inList.response.length > 0;
   let sessionId = null;
   let heights = null; // video heights OME is really producing, null = not known
   if (live) {
@@ -633,6 +638,7 @@ let episodeChannelLastError = null;
 
 function manageEpisodeChannel(ep) {
   if (!ep) return; // episode poll failed - leave things as they are
+  if (DIRECT_INGEST_CHANNELS.has('episode')) return; // no permanent channel to retire
   try {
     if (ep.obs) {
       if (readSetting(EPISODE_OBS_ABSENT_KEY) !== '') writeSetting(EPISODE_OBS_ABSENT_KEY, '');
