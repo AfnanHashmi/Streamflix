@@ -288,8 +288,14 @@ function initAccessTokens(db, app, jwt, IS_PROD, JWT_SECRET, SITE_ORIGIN) {
   console.log('[AccessTokens] Initialised — /access and /admin/current-link routes registered.');
 }
 
+// Plain yes/no for routes that need to answer in their own format (JSON).
+function hasAccessSession(req) {
+  return !!verifyAccessCookie(req);
+}
+
 module.exports = {
   initAccessTokens,
   requireAccessSession,
   gateStream,
+  hasAccessSession,
 };

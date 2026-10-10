@@ -1,4 +1,10 @@
 require('dotenv').config();
+// pm2 logs carry no timestamps, which made incidents hard to line up with
+// OME's and nginx's logs - every console line now starts with the UTC time.
+for (const level of ['log', 'info', 'warn', 'error']) {
+  const orig = console[level].bind(console);
+  console[level] = (...args) => orig(new Date().toISOString(), ...args);
+}
 const http = require('http');
 const express = require('express');
 const { Server } = require('socket.io');
@@ -13,7 +19,7 @@ const fs = require('fs');
 const { pipeline } = require('stream');
 const path = require('path');
 const crypto = require('crypto');
-const { initAccessTokens, requireAccessSession, gateStream } = require('./accessTokens');
+const { initAccessTokens, requireAccessSession, gateStream, hasAccessSession } = require('./accessTokens');
 const rateLimit = require('express-rate-limit');
 
 // ---------- Channels ----------
@@ -602,18 +608,29 @@ function availableQualityKeys(channel) {
 // opens it within the next minute; after that it is simply gone.
 const EPISODE_BANNER_MS = 60 * 1000;
 const EPISODE_BANNER_MIN_OFFLINE_MS = 3 * 60 * 1000;
+// A short test stream (OBS checks, a mistaken start) must not announce an
+// episode to everyone: the banner waits until the stream has been on air this long.
+const EPISODE_BANNER_MIN_ONAIR_MS = 2 * 60 * 1000;
 let episodeOfflineSince = null;
+let episodeOnAirSince = null;
+let episodeBannerPending = false;
 let episodeBannerAt = 0;
 
 function trackEpisodeStart(ep) {
   if (!ep) return; // episode poll failed - leave things as they are
   if (!ep.live) {
     if (episodeOfflineSince === null) episodeOfflineSince = Date.now();
+    episodeOnAirSince = null;
+    episodeBannerPending = false;
     return;
   }
-  const wasOffLongEnough = episodeOfflineSince !== null && Date.now() - episodeOfflineSince >= EPISODE_BANNER_MIN_OFFLINE_MS;
-  episodeOfflineSince = null;
-  if (wasOffLongEnough) {
+  if (episodeOnAirSince === null) {
+    episodeOnAirSince = Date.now();
+    episodeBannerPending = episodeOfflineSince !== null && Date.now() - episodeOfflineSince >= EPISODE_BANNER_MIN_OFFLINE_MS;
+    episodeOfflineSince = null;
+  }
+  if (episodeBannerPending && Date.now() - episodeOnAirSince >= EPISODE_BANNER_MIN_ONAIR_MS) {
+    episodeBannerPending = false;
     episodeBannerAt = Date.now();
     io.to(roomOf('live')).emit('episode_started', { ms: EPISODE_BANNER_MS });
     console.log('[Episode] Episode is on air - banner sent to live viewers.');
@@ -979,6 +996,20 @@ io.use((socket, next) => {
     return next(err);
   }
 
+  // The pages are behind the rotating link, but this socket was open to anyone:
+  // chat could be read live, and made-up viewer ids inflated "Watching".
+  // Checked after the ban test so a banned viewer still gets the ban notice.
+  let hasAccess = false;
+  try {
+    const raw = parseCookie(socket.handshake.headers.cookie || '').access_session;
+    hasAccess = !!raw && jwt.verify(raw, JWT_SECRET).type === 'access_session';
+  } catch {}
+  if (!hasAccess) {
+    const err = new Error('access link required');
+    err.data = { code: 'ACCESS_REQUIRED' };
+    return next(err);
+  }
+
   next();
 });
 
@@ -1006,6 +1037,29 @@ const anonPresenceMap = new Map(); // viewerId -> Set(socketIds)
 // A person with both pages open counts once on each. Kept incrementally
 // (viewerKey -> that viewer's socket ids), so connect/disconnect stay O(1).
 const channelViewers = { live: new Map(), episode: new Map() };
+
+// "Watching" used to exist only in memory, so there was no way to answer how
+// many people watched yesterday. One row a minute (two small numbers, ~1,440 a
+// day) is enough for real history; rows older than 180 days are dropped.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS viewer_counts (
+    ts INTEGER PRIMARY KEY,
+    live_viewers INTEGER NOT NULL,
+    episode_viewers INTEGER NOT NULL,
+    live_on INTEGER NOT NULL,
+    episode_on INTEGER NOT NULL
+  )
+`);
+setInterval(() => {
+  try {
+    const ts = Math.floor(Date.now() / 60000) * 60000;
+    db.prepare('INSERT OR IGNORE INTO viewer_counts (ts, live_viewers, episode_viewers, live_on, episode_on) VALUES (?, ?, ?, ?, ?)')
+      .run(ts, channelViewers.live.size, channelViewers.episode.size, streamStates.live.obs === true ? 1 : 0, streamStates.episode.obs === true ? 1 : 0);
+    if (new Date(ts).getUTCMinutes() === 0) db.prepare('DELETE FROM viewer_counts WHERE ts < ?').run(ts - 180 * 86400 * 1000);
+  } catch (err) {
+    console.error('[Viewer history] write failed:', err.message || err);
+  }
+}, 60 * 1000);
 
 function broadcastViewerCount(channel) {
   io.to(roomOf(channel)).emit('viewer_count', channelViewers[channel].size);
@@ -1514,6 +1568,38 @@ function normalizeXPfp(url) {
 }
 
 
+// OAuth state (state + PKCE verifier + return page) is kept here as well as in
+// the cookie. On iPhones the sign-in often finishes in a different browser
+// context than it started in (X's app, in-app browsers), so the cookie never
+// arrives and 56% of iPhone X sign-ins failed with "missing cookie". The
+// callback's own `state` query value is the key, so it works wherever the
+// browser lands. Single-use, 10 minutes.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS oauth_states (
+    state TEXT PRIMARY KEY,
+    payload TEXT NOT NULL,
+    expires_at INTEGER NOT NULL
+  )
+`);
+function saveOAuthState(state, payload) {
+  db.prepare('INSERT OR REPLACE INTO oauth_states (state, payload, expires_at) VALUES (?, ?, ?)')
+    .run(state, JSON.stringify(payload), Date.now() + 10 * 60 * 1000);
+}
+function takeOAuthState(state, type) {
+  if (typeof state !== 'string' || state.length === 0 || state.length > 100) return null;
+  const row = db.prepare('SELECT payload, expires_at FROM oauth_states WHERE state = ?').get(state);
+  if (!row) return null;
+  db.prepare('DELETE FROM oauth_states WHERE state = ?').run(state);
+  if (row.expires_at < Date.now()) return null;
+  try {
+    const p = JSON.parse(row.payload);
+    return p.type === type && p.state === state ? p : null;
+  } catch { return null; }
+}
+setInterval(() => {
+  try { db.prepare('DELETE FROM oauth_states WHERE expires_at < ?').run(Date.now()); } catch {}
+}, 10 * 60 * 1000);
+
 app.get('/api/auth/x/start', (req, res) => {
   if (!process.env.X_CLIENT_ID || !process.env.X_REDIRECT_URI) {
     console.error('[X Signup] X_CLIENT_ID/X_REDIRECT_URI not configured');
@@ -1526,7 +1612,9 @@ app.get('/api/auth/x/start', (req, res) => {
 
   // Ephemeral OAuth state, kept the same way access_session is - a signed,
   // short-expiry JWT in a cookie - rather than a new DB table + sweeper.
-  const oauthJwt = jwt.sign({ type: 'x_oauth', state, codeVerifier, returnTo: safeReturnTo(req.query.return) }, JWT_SECRET, { expiresIn: '10m' });
+  const returnTo = safeReturnTo(req.query.return);
+  saveOAuthState(state, { type: 'x_oauth', state, codeVerifier, returnTo });
+  const oauthJwt = jwt.sign({ type: 'x_oauth', state, codeVerifier, returnTo }, JWT_SECRET, { expiresIn: '10m' });
   res.cookie('x_oauth', oauthJwt, {
     httpOnly: true,
     secure: IS_PROD,
@@ -1562,16 +1650,21 @@ app.get('/api/auth/x/callback', async (req, res) => {
 
     const { code, state } = req.query;
     const oauthCookie = req.cookies.x_oauth;
-    if (!code || !state || !oauthCookie) return failRedirect('missing code/state/cookie');
+    if (!code || !state) return failRedirect('missing code/state');
 
-    let oauthPayload;
-    try {
-      oauthPayload = jwt.verify(oauthCookie, JWT_SECRET);
-    } catch {
-      return failRedirect('invalid or expired x_oauth cookie');
-    }
-    if (oauthPayload.type !== 'x_oauth' || oauthPayload.state !== state) {
-      return failRedirect('state mismatch');
+    // Server-side record first (works when the browser came back without its
+    // cookie); the cookie still covers sign-ins started before this existed.
+    let oauthPayload = takeOAuthState(String(state), 'x_oauth');
+    if (!oauthPayload) {
+      if (!oauthCookie) return failRedirect('unknown or expired state, no cookie');
+      try {
+        oauthPayload = jwt.verify(oauthCookie, JWT_SECRET);
+      } catch {
+        return failRedirect('invalid or expired x_oauth cookie');
+      }
+      if (oauthPayload.type !== 'x_oauth' || oauthPayload.state !== state) {
+        return failRedirect('state mismatch');
+      }
     }
     res.clearCookie('x_oauth');
 
@@ -1721,8 +1814,18 @@ function normalizeGooglePfp(url) {
 // Google gives no handle to lock a username to, so one is derived from the
 // email's local part. Collisions are resolved by the caller appending an
 // incrementing suffix - see the "new account" branch below.
+const USERNAME_RE = /^[A-Za-z0-9_]{3,20}$/;
 function deriveGoogleUsername(email) {
-  return (email.split('@')[0].replace(/[^a-zA-Z0-9_]/g, '') || 'user');
+  const base = email.split('@')[0].replace(/[^a-zA-Z0-9_]/g, '').slice(0, 20);
+  return base.length >= 3 ? base : (base + 'user').slice(0, 20);
+}
+// Lookalikes of reserved names ("Admin_", "4dmin") are refused too: compared
+// ignoring case, underscores and common digit swaps. Exact match only, so real
+// names that merely contain "root" or "admin" (groot, badminton) stay allowed;
+// "streamflix" is blocked anywhere since it is the site's own name.
+function isReservedLookalike(name) {
+  const n = name.toLowerCase().replace(/_/g, '').replace(/0/g, 'o').replace(/[1!]/g, 'i').replace(/3/g, 'e').replace(/4/g, 'a').replace(/5/g, 's');
+  return RESERVED_USERNAMES.includes(n) || n.includes('streamflix');
 }
 
 // Restricted after a cluster of throwaway-domain (.shop/.store) Google
@@ -1748,7 +1851,9 @@ app.get('/api/auth/google/start', (req, res) => {
 
   // Same ephemeral-cookie pattern as x_oauth above - a signed, short-expiry
   // JWT rather than a new DB table + sweeper.
-  const oauthJwt = jwt.sign({ type: 'google_oauth', state, codeVerifier, returnTo: safeReturnTo(req.query.return) }, JWT_SECRET, { expiresIn: '10m' });
+  const returnTo = safeReturnTo(req.query.return);
+  saveOAuthState(state, { type: 'google_oauth', state, codeVerifier, returnTo });
+  const oauthJwt = jwt.sign({ type: 'google_oauth', state, codeVerifier, returnTo }, JWT_SECRET, { expiresIn: '10m' });
   res.cookie('google_oauth', oauthJwt, {
     httpOnly: true,
     secure: IS_PROD,
@@ -1784,16 +1889,21 @@ app.get('/api/auth/google/callback', async (req, res) => {
 
     const { code, state } = req.query;
     const oauthCookie = req.cookies.google_oauth;
-    if (!code || !state || !oauthCookie) return failRedirect('missing code/state/cookie');
+    if (!code || !state) return failRedirect('missing code/state');
 
-    let oauthPayload;
-    try {
-      oauthPayload = jwt.verify(oauthCookie, JWT_SECRET);
-    } catch {
-      return failRedirect('invalid or expired google_oauth cookie');
-    }
-    if (oauthPayload.type !== 'google_oauth' || oauthPayload.state !== state) {
-      return failRedirect('state mismatch');
+    // Server-side record first (works when the browser came back without its
+    // cookie); the cookie still covers sign-ins started before this existed.
+    let oauthPayload = takeOAuthState(String(state), 'google_oauth');
+    if (!oauthPayload) {
+      if (!oauthCookie) return failRedirect('unknown or expired state, no cookie');
+      try {
+        oauthPayload = jwt.verify(oauthCookie, JWT_SECRET);
+      } catch {
+        return failRedirect('invalid or expired google_oauth cookie');
+      }
+      if (oauthPayload.type !== 'google_oauth' || oauthPayload.state !== state) {
+        return failRedirect('state mismatch');
+      }
     }
     res.clearCookie('google_oauth');
 
@@ -1945,7 +2055,10 @@ app.post('/api/auth/google/complete', (req, res) => {
     const cleanUsername = String((req.body || {}).username || '').trim();
     const useAvatar = !!(req.body || {}).useAvatar;
     if (!cleanUsername) return res.status(400).json({ error: 'Username is required.' });
-    if (RESERVED_USERNAMES.includes(cleanUsername.toLowerCase())) {
+    if (!USERNAME_RE.test(cleanUsername)) {
+      return res.status(400).json({ error: 'Username must be 3-20 characters: letters, numbers or underscore.' });
+    }
+    if (isReservedLookalike(cleanUsername)) {
       return res.status(403).json({ error: 'This username is reserved.' });
     }
     if (db.prepare('SELECT id FROM users WHERE LOWER(username) = LOWER(?)').get(cleanUsername)) {
@@ -2179,13 +2292,15 @@ app.delete('/api/library/videos/:id', requireAuth, requireAdmin, (req, res) => {
 //                 the player is open - so a watch ends ~2 min after the
 //                 player is closed, and reopening within that window
 //                 continues the SAME watch (grace for refresh / phone lock).
-//   download link one-off URL, 10 min, whole file as an attachment.
+//   download link one-off URL, 6 h (resumable), whole file as an attachment.
 // Each user gets R2_WATCH_LIMIT watches per video; after that the video is
 // download-only. Admins are exempt (so testing never locks the owner out).
 // Everything sits behind login + the rotating access link (gateStream).
 const R2_WATCH_LIMIT = 2;
 const R2_WATCH_GRACE_MS = 2 * 60 * 1000;
-const R2_DOWNLOAD_TTL_MS = 10 * 60 * 1000;
+// 6h so a 20+ GB download that drops can resume with the same link (the Worker now
+// honours Range on /d/); the old 10 min only covered an uninterrupted start.
+const R2_DOWNLOAD_TTL_MS = 6 * 60 * 60 * 1000;
 const MEDIA_ORIGIN = process.env.MEDIA_ORIGIN || 'https://media.biggboss24hrs.com';
 
 function signMediaPass(payload) {
@@ -3086,7 +3201,15 @@ async function cutAndStreamClip(req, res, { startMs, durationSec, quality, onPro
   }
 }
 
-app.post('/api/clips', requireAuth, async (req, res) => {
+// Clips cut the real stream, so they need today's link like the stream URL
+// does. JSON, not gateStream's plain text, because the clip dialog reads
+// data.error to tell the viewer what to do.
+function requireAccessForClips(req, res, next) {
+  if (hasAccessSession(req)) return next();
+  return res.status(403).json({ error: "Today's access link has changed. Open the new link from the group, then try again." });
+}
+
+app.post('/api/clips', requireAuth, requireAccessForClips, async (req, res) => {
   const userId = req.user?.id;
   if (clipByteBudgetExceeded(userId)) {
     return res.status(429).json({ error: 'Clip data limit reached for now - please wait a few minutes.' });
@@ -3145,7 +3268,7 @@ function clipSignature(startSec, durationSec, quality, channel = 'live') {
     .slice(0, 24);
 }
 
-app.post('/api/clips/sign', requireAuth, (req, res) => {
+app.post('/api/clips/sign', requireAuth, requireAccessForClips, (req, res) => {
   const userId = req.user?.id;
   if (clipByteBudgetExceeded(userId)) {
     return res.status(429).json({ error: 'Clip data limit reached for now - please wait a few minutes.' });
