@@ -2292,15 +2292,13 @@ app.delete('/api/library/videos/:id', requireAuth, requireAdmin, (req, res) => {
 //                 the player is open - so a watch ends ~2 min after the
 //                 player is closed, and reopening within that window
 //                 continues the SAME watch (grace for refresh / phone lock).
-//   download link one-off URL, 6 h (resumable), whole file as an attachment.
+//   download link one-off URL, 10 min, whole file as an attachment.
 // Each user gets R2_WATCH_LIMIT watches per video; after that the video is
 // download-only. Admins are exempt (so testing never locks the owner out).
 // Everything sits behind login + the rotating access link (gateStream).
 const R2_WATCH_LIMIT = 2;
 const R2_WATCH_GRACE_MS = 2 * 60 * 1000;
-// 6h so a 20+ GB download that drops can resume with the same link (the Worker now
-// honours Range on /d/); the old 10 min only covered an uninterrupted start.
-const R2_DOWNLOAD_TTL_MS = 6 * 60 * 60 * 1000;
+const R2_DOWNLOAD_TTL_MS = 10 * 60 * 1000;
 const MEDIA_ORIGIN = process.env.MEDIA_ORIGIN || 'https://media.biggboss24hrs.com';
 
 function signMediaPass(payload) {
