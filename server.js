@@ -28,7 +28,7 @@ const rateLimit = require('express-rate-limit');
 // "episode"). Both hostnames reach this one backend and serve the same page
 // code, so the channel is decided by which hostname the request arrived on -
 // that way the episode page can call the exact same API paths as /live and
-// automatically get its own stream, title, chat and polls.
+// automatically get its own stream, title and chat.
 const SITE_ORIGIN = process.env.SITE_ORIGIN || 'https://biggboss24hrs.com';
 const EPISODE_HOST = 'episode.biggboss24hrs.com';
 const EPISODE_ORIGIN = `https://${EPISODE_HOST}`;
@@ -142,7 +142,9 @@ app.get(['/', '/index.html'], (req, res, next) => {
   }
 });
 
-app.get(['/', '/index.html'], requireAccessSession, (req, res) => {
+// The home page is public (no access link needed); Live and Episode stay behind the link.
+app.get(['/', '/index.html'], (req, res) => {
+  res.set('Cache-Control', 'no-store');
   res.sendFile('/var/www/streamflix/index.html');
 });
 
@@ -215,48 +217,12 @@ db.exec(`
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY(folder_id) REFERENCES library_folders(id) ON DELETE CASCADE
   );
-
-  CREATE TABLE IF NOT EXISTS polls (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    question TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'open',
-    created_by TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    closed_at DATETIME
-  );
-
-  CREATE TABLE IF NOT EXISTS poll_options (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    poll_id INTEGER NOT NULL,
-    label TEXT NOT NULL,
-    position INTEGER DEFAULT 0,
-    FOREIGN KEY(poll_id) REFERENCES polls(id) ON DELETE CASCADE
-  );
-
-  -- UNIQUE(poll_id, user_id) enforces one vote per user in the DB itself,
-  -- so a double-submit or race can't double-count.
-  CREATE TABLE IF NOT EXISTS poll_votes (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    poll_id INTEGER NOT NULL,
-    option_id INTEGER NOT NULL,
-    user_id INTEGER NOT NULL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(poll_id, user_id),
-    FOREIGN KEY(poll_id) REFERENCES polls(id) ON DELETE CASCADE
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_poll_votes_poll ON poll_votes(poll_id);
-  CREATE INDEX IF NOT EXISTS idx_poll_options_poll ON poll_options(poll_id);
 `);
 
 try {
   db.exec(`ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'user'`);
 } catch (e) {}
 
-// Multi-poll support: each poll now carries its own fixed lifecycle instead
-// of the old "one poll at a time" model. CREATE TABLE IF NOT EXISTS won't add
-// columns to an already-existing table, so these are guarded the same way as
-// the users.role migration above.
 // Sign in with X: a proven X identity locks the username and drives chat
 // styling. x_id IS NOT NULL is itself the "locked" flag - no separate
 // column needed, since no route anywhere lets a user edit their username.
@@ -329,13 +295,6 @@ function banIdentity(type, value, reason) {
 // required grepping chat/poll history for indirect evidence.
 try { db.exec(`ALTER TABLE users ADD COLUMN last_seen DATETIME`); } catch (e) {}
 
-try {
-  db.exec(`ALTER TABLE polls ADD COLUMN closes_at DATETIME`);
-} catch (e) {}
-try {
-  db.exec(`ALTER TABLE polls ADD COLUMN expires_at DATETIME`);
-} catch (e) {}
-db.exec(`CREATE INDEX IF NOT EXISTS idx_polls_status ON polls(status)`);
 
 // Library: a folder is either 'drive' (Google Drive embeds, the original and
 // default) or 'r2' (private files in the Cloudflare R2 bucket, served by the
@@ -395,10 +354,11 @@ try { db.exec(`ALTER TABLE library_folders ADD COLUMN naming TEXT`); } catch (e)
 db.prepare(`UPDATE library_folders SET naming = 'episode' WHERE naming IS NULL AND title = 'Bigg Boss 20'`).run();
 db.prepare(`UPDATE library_folders SET naming = 'livefeed' WHERE naming IS NULL AND title = 'BB 24Hrs Channel (Beta)'`).run();
 
-// Per-channel chat and polls: every row belongs to exactly one page. Existing
+// Per-channel chat: every row belongs to exactly one page. Existing
 // rows predate the episode page, so the DEFAULT 'live' assigns them correctly.
 try { db.exec(`ALTER TABLE chat_messages ADD COLUMN channel TEXT NOT NULL DEFAULT 'live'`); } catch (e) {}
-try { db.exec(`ALTER TABLE polls ADD COLUMN channel TEXT NOT NULL DEFAULT 'live'`); } catch (e) {}
+// Reply-to: the id of the message this one answers (NULL for a normal message).
+try { db.exec(`ALTER TABLE chat_messages ADD COLUMN reply_to INTEGER`); } catch (e) {}
 db.exec(`CREATE INDEX IF NOT EXISTS idx_chat_channel ON chat_messages(channel, id)`);
 
 // ---------- Access-token system ----------
@@ -1168,17 +1128,33 @@ io.on('connection', (socket) => {
              CASE WHEN u.x_verified = 1 THEN 1 ELSE 0 END as xVerified,
              u.x_pfp_url as xPfpUrl,
              CASE WHEN u.google_native = 1 THEN 1 ELSE 0 END as isGoogleUser,
-             u.google_pfp_url as googlePfpUrl
+             u.google_pfp_url as googlePfpUrl,
+             cm.reply_to as replyId,
+             p.username as replyUsername,
+             substr(p.message, 1, 120) as replySnippet
       FROM chat_messages cm
       LEFT JOIN users u ON LOWER(cm.username) = LOWER(u.username)
+      LEFT JOIN chat_messages p ON p.id = cm.reply_to AND p.channel = cm.channel
       WHERE cm.created_at >= datetime('now', '-24 hours') AND cm.channel = ?
       ORDER BY cm.id ASC
     `).all(channel);
+
+    // The quoted message is read live (not copied), so when it is purged - the
+    // 24h cleanup, or a ban deleting a user's messages - the reply just says
+    // the original is gone instead of keeping the quoted text around.
+    for (const row of history) {
+      row.replyTo = row.replyId
+        ? (row.replyUsername ? { id: row.replyId, username: row.replyUsername, snippet: row.replySnippet } : { id: row.replyId, deleted: true })
+        : null;
+      delete row.replyId; delete row.replyUsername; delete row.replySnippet;
+    }
 
     socket.emit('chat_history', history);
   } catch (err) {
     console.error('Failed to retrieve chat history:', err);
   }
+  try { socket.emit('meters_state', readAllMeters()); }
+  catch (err) { console.error('[Meters] state error:', err); }
 
   // Handle incoming live message
   // A packet with no body (data undefined) used to throw inside this handler
@@ -1201,11 +1177,19 @@ io.on('connection', (socket) => {
     chatSendTimes.push(nowMs);
 
     try {
+      // Reply: only to a message that exists on THIS page's chat. A bad or
+      // stale id just sends the message as a normal one.
+      let parent = null;
+      const wantedParent = Number(data.replyTo);
+      if (Number.isSafeInteger(wantedParent) && wantedParent > 0) {
+        parent = db.prepare('SELECT id, username, message FROM chat_messages WHERE id = ? AND channel = ?').get(wantedParent, channel) || null;
+      }
+
       // Save message into SQLite
       const info = db.prepare(`
-        INSERT INTO chat_messages (username, message, channel)
-        VALUES (?, ?, ?)
-      `).run(senderUsername, cleanMsg, channel);
+        INSERT INTO chat_messages (username, message, channel, reply_to)
+        VALUES (?, ?, ?, ?)
+      `).run(senderUsername, cleanMsg, channel, parent ? parent.id : null);
 
       const timestamp = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 
@@ -1221,7 +1205,8 @@ io.on('connection', (socket) => {
         xVerified: isSenderXVerified,
         xPfpUrl: senderXPfpUrl,
         isGoogleUser: isSenderGoogle,
-        googlePfpUrl: senderGooglePfpUrl
+        googlePfpUrl: senderGooglePfpUrl,
+        replyTo: parent ? { id: parent.id, username: parent.username, snippet: parent.message.slice(0, 120) } : null
       });
     } catch (err) {
       console.error('Failed to save chat message:', err);
@@ -1752,7 +1737,6 @@ app.get('/api/auth/x/callback', async (req, res) => {
         // transfers. Deleting them is what makes the displacement correct,
         // not optional cleanup.
         db.prepare('DELETE FROM chat_messages WHERE LOWER(username) = LOWER(?)').run(clash.username);
-        db.prepare('DELETE FROM poll_votes WHERE user_id = ?').run(clash.id);
         db.prepare('DELETE FROM users WHERE id = ?').run(clash.id);
         console.log(`[X Signup] Displaced local user "${clash.username}" (id ${clash.id}) for verified X handle @${xHandle}`);
       }
@@ -2185,6 +2169,22 @@ app.delete('/api/library/folders/:id', requireAuth, requireAdmin, (req, res) => 
 });
 
 // GET /api/library/folders/:folderId/videos (Public)
+// The signed-in user's id if there is a valid session, else null - for routes
+// that work for everyone but add per-user details when logged in. (It used to
+// live with the poll code; the library still needs it.)
+function optionalUserId(req) {
+  try {
+    let token = req.cookies && req.cookies.streamflix_session;
+    if (!token && req.headers.authorization && req.headers.authorization.startsWith('Bearer ')) {
+      token = req.headers.authorization.split(' ')[1];
+    }
+    if (!token) return null;
+    return jwt.verify(token, JWT_SECRET).id || null;
+  } catch {
+    return null;
+  }
+}
+
 app.get('/api/library/folders/:folderId/videos', (req, res) => {
   try {
     const folderId = req.params.folderId;
@@ -2454,6 +2454,92 @@ async function addR2Video(req, res) {
   }
 }
 
+// ---- Machine-to-machine: the recording PC registers / removes recordings ----
+// POST /api/library/recordings registers a file already uploaded to R2 on an
+// R2 library card. DELETE only ever removes rows whose title starts with
+// "TEST", so a leaked key cannot delete real recordings. With no
+// RECORDINGS_PUBLISH_KEY set, every request is refused.
+const recordingsLimiter = makeLimiter(60 * 1000, 30, 'Too many requests.');
+const RECORDINGS_PREFIX = '24Hrs Channel/';
+const RECORDINGS_DEFAULT_FOLDER = 6;
+const RECORDING_TITLE_MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sept', 'Oct', 'Nov', 'Dec'];
+
+function requireRecordingsKey(req, res, next) {
+  const key = process.env.RECORDINGS_PUBLISH_KEY;
+  if (!key) return res.status(401).json({ error: 'Unauthorized' });
+  const header = String(req.headers.authorization || '');
+  const supplied = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
+  const a = Buffer.from(supplied), b = Buffer.from(key);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return res.status(401).json({ error: 'Unauthorized' });
+  next();
+}
+
+// "2026-10-19 10:00:01" + end "01:00" -> "Live Feed 19thOct2026 10:00 - 01:00(next day)"
+function liveFeedTitleFromTime(sortAt, end) {
+  const m = String(sortAt || '').match(/^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2})/);
+  if (!m) return null;
+  const day = Number(m[3]), v = day % 100;
+  const ord = day + ((v >= 11 && v <= 13) ? 'th' : ({ 1: 'st', 2: 'nd', 3: 'rd' }[day % 10] || 'th'));
+  const start = `${m[4]}:${m[5]}`;
+  return `Live Feed ${ord}${RECORDING_TITLE_MONTHS[Number(m[2]) - 1]}${m[1]} ${start} - ${end}` + (end <= start ? '(next day)' : '');
+}
+
+app.post('/api/library/recordings', recordingsLimiter, requireRecordingsKey, express.json({ limit: '16kb' }), async (req, res) => {
+  try {
+    const body = req.body || {};
+    const folderId = body.folder_id === undefined ? RECORDINGS_DEFAULT_FOLDER : Number(body.folder_id);
+    const key = typeof body.r2_key === 'string' ? body.r2_key.trim() : '';
+    const end = body.end === undefined ? '01:00' : body.end;
+    if (!Number.isInteger(folderId) || folderId < 1) return res.status(400).json({ error: 'folder_id must be a folder number' });
+    if (!key || key.length > 300 || !key.startsWith(RECORDINGS_PREFIX) || !/\.mp4$/i.test(key) || key.includes('..')) {
+      return res.status(400).json({ error: `r2_key must start with "${RECORDINGS_PREFIX}" and end in .mp4` });
+    }
+    if (typeof end !== 'string' || !/^([01]\d|2[0-3]):[0-5]\d$/.test(end)) return res.status(400).json({ error: 'end must be HH:MM' });
+    for (const f of ['title', 'description']) {
+      if (body[f] !== undefined && (typeof body[f] !== 'string' || body[f].length > 300)) return res.status(400).json({ error: `${f} must be text up to 300 characters` });
+    }
+    const folder = db.prepare('SELECT storage FROM library_folders WHERE id = ?').get(folderId);
+    if (!folder || folder.storage !== 'r2') return res.status(400).json({ error: 'folder_id is not an R2 folder' });
+
+    const existing = db.prepare('SELECT id FROM library_videos WHERE r2_key = ?').get(key);
+    if (existing) return res.status(409).json({ error: 'That file is already added', id: existing.id, video: { id: existing.id } });
+
+    const found = (await r2ListObjects(key, 10)).find(o => o.key === key);
+    if (!found) return res.status(404).json({ error: 'That file is not in the bucket' });
+
+    const sortAt = recordingTimeFromKey(key);
+    const title = String(body.title || '').trim() || liveFeedTitleFromTime(sortAt, end);
+    if (!title) return res.status(400).json({ error: 'Could not work out a title; send "title" or use a time in the file name' });
+
+    const info = db.prepare(`
+      INSERT INTO library_videos (folder_id, title, video_url, drive_id, description, r2_key, size_bytes, sort_at)
+      VALUES (?, ?, ?, NULL, ?, ?, ?, ?)
+    `).run(folderId, title, `r2:${key}`, String(body.description || '').trim(), key, found.size, sortAt);
+    queueR2Thumbnail(Number(info.lastInsertRowid), key);
+    console.log(`[R2] Recording registered by key: video ${info.lastInsertRowid}.`);
+    res.status(201).json({ success: true, video: { id: info.lastInsertRowid, folder_id: folderId, title, size_bytes: found.size, storage: 'r2' } });
+  } catch (err) {
+    console.error('[R2] register recording error:', err.message || err);
+    res.status(500).json({ error: 'Failed to add recording' });
+  }
+});
+
+app.delete('/api/library/recordings/:id', recordingsLimiter, requireRecordingsKey, (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const row = Number.isInteger(id) ? db.prepare('SELECT id, title FROM library_videos WHERE id = ?').get(id) : null;
+    if (!row) return res.status(404).json({ error: 'Video not found' });
+    if (!row.title.startsWith('TEST')) return res.status(403).json({ error: 'Only test recordings (title starting with TEST) can be removed this way' });
+    db.prepare('DELETE FROM library_watches WHERE video_id = ?').run(id);
+    db.prepare('DELETE FROM library_videos WHERE id = ?').run(id);
+    fs.unlink(path.join(THUMB_DIR, `r2-${id}.jpg`), () => {});
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[R2] remove recording error:', err.message || err);
+    res.status(500).json({ error: 'Failed to remove recording' });
+  }
+});
+
 // Start or continue a watch. Counts a new watch only when no watch of this
 // video by this user was alive within the last 2 minutes.
 app.post('/api/library/r2/:videoId/watch', r2Limiter, requireAuth, gateStream, (req, res) => {
@@ -2530,334 +2616,791 @@ app.post('/api/library/r2/:videoId/download', r2Limiter, requireAuth, gateStream
   res.json({ url: `${MEDIA_ORIGIN}/d/${video.id}?t=${token}` });
 });
 
-// ---------- Live Polls & Predictions ----------
-// Poll state lives in the DB, so polls and votes survive a restart.
+// ---------- Trending ----------
+// The counts are produced by the owner's phone app (manually triggered, it holds
+// the X access). After a run the app POSTs the result here; this stores it and
+// pushes it to every connected viewer, so one run updates app and website with
+// no second X lookup. Nothing here ever calls X.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS meter_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL CHECK (kind IN ('trend')),
+    payload TEXT NOT NULL,
+    refreshed_at INTEGER NOT NULL,
+    received_at INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_meter_kind ON meter_snapshots(kind, id);
+`);
 
-const POLL_MAX_OPTIONS = 10;
-const POLL_MAX_QUESTION_LEN = 300;
-const POLL_MAX_OPTION_LEN = 100;
-const POLL_MAX_ACTIVE = 5;
-const POLL_RUN_HOURS = 12;
-const POLL_RESULTS_HOURS = 8;
-
-function buildPollPayload(pollId, userId) {
-  const poll = db.prepare('SELECT * FROM polls WHERE id = ?').get(pollId);
-  if (!poll) return null;
-
-  const options = db.prepare(`
-    SELECT o.id, o.label,
-           (SELECT COUNT(*) FROM poll_votes v WHERE v.option_id = o.id) AS votes
-    FROM poll_options o
-    WHERE o.poll_id = ?
-    ORDER BY o.position ASC, o.id ASC
-  `).all(pollId);
-
-  const totalVotes = options.reduce((sum, o) => sum + o.votes, 0);
-
-  let yourVote = null;
-  if (userId) {
-    const row = db.prepare('SELECT option_id FROM poll_votes WHERE poll_id = ? AND user_id = ?').get(pollId, userId);
-    if (row) yourVote = row.option_id;
-  }
-
-  return {
-    id: poll.id,
-    channel: poll.channel || 'live',
-    question: poll.question,
-    status: poll.status,
-    created_at: poll.created_at,
-    closed_at: poll.closed_at,
-    closes_at: poll.closes_at,
-    expires_at: poll.expires_at,
-    options,
-    totalVotes,
-    yourVote
-  };
+const METER_MAX_ITEMS = 50;
+const METER_MAX_LABEL = 120;
+const METER_KEEP_MS = 30 * 24 * 60 * 60 * 1000;
+const METER_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+const METER_MAX_HOURS = 48;
+const HOUR_MS = 60 * 60 * 1000;
+// Optional lines of text the app can attach to a run or to one item; they
+// show in the home page Updates threads.
+const METER_MAX_INSIGHTS = 5;
+const METER_MAX_INSIGHT_LEN = 200;
+const meterPublishLimiter = makeLimiter(60 * 1000, 30, 'Too many requests.');
+db.exec(`CREATE INDEX IF NOT EXISTS idx_meter_kind_time ON meter_snapshots(kind, refreshed_at)`);
+// The run time exactly as the app sent it (refreshed_at may have been pulled
+// back to "now"); lets a re-send of a Trend run find the run it belongs to.
+if (!db.prepare('PRAGMA table_info(meter_snapshots)').all().some(c => c.name === 'sent_at')) {
+  db.exec('ALTER TABLE meter_snapshots ADD COLUMN sent_at INTEGER');
 }
 
-// Results are broadcast at most once a second per poll, so a burst of votes
-// can't flood every connected socket. Leading edge fires immediately; a
-// trailing emit catches votes that landed during the window.
-const pollResultsThrottle = new Map();
-
-function broadcastPollResults(pollId, { immediate = false } = {}) {
-  const emit = () => {
-    const payload = buildPollPayload(pollId, null);
-    if (payload) io.to(roomOf(payload.channel)).emit('poll_results', payload);
-  };
-
-  if (immediate) {
-    const entry = pollResultsThrottle.get(pollId);
-    if (entry && entry.timer) clearTimeout(entry.timer);
-    pollResultsThrottle.delete(pollId);
-    emit();
-    return;
-  }
-
-  const existing = pollResultsThrottle.get(pollId);
-  if (existing) {
-    existing.pending = true;
-    return;
-  }
-
-  emit();
-  const timer = setTimeout(() => {
-    const entry = pollResultsThrottle.get(pollId);
-    pollResultsThrottle.delete(pollId);
-    if (entry && entry.pending) emit();
-  }, 1000);
-  pollResultsThrottle.set(pollId, { timer, pending: false });
+// Collapses whitespace (incl. newlines) and drops control characters, so
+// "Boss  Ka Raaj" and "Boss Ka Raaj" are the same tagline across runs.
+function normalizeMeterLabel(s) {
+  return s.replace(/[\u0000-\u001F\u007F]/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
-// Resolves the caller's user id if they happen to be logged in, without
-// requiring it (used by the public GET so we can return "yourVote").
-function optionalUserId(req) {
-  try {
-    let token = req.cookies && req.cookies.streamflix_session;
-    if (!token && req.headers.authorization && req.headers.authorization.startsWith('Bearer ')) {
-      token = req.headers.authorization.split(' ')[1];
-    }
-    if (!token) return null;
-    return jwt.verify(token, JWT_SECRET).id || null;
-  } catch {
-    return null;
+// Trending colours are chosen here, once, and stored with the snapshot, so a
+// tagline keeps its colour across refreshes and on every viewer's screen, and
+// two taglines on screen never share one (up to the palette size the page
+// uses). A tagline that stays keeps its colour; a new one takes the lowest free
+// colour; one that comes back gets its old colour if it is still free.
+function assignTrendColors(labels) {
+  let map = {};
+  try { map = JSON.parse(readSetting('trend_colors') || '{}') || {}; } catch (e) { map = {}; }
+  const keys = labels.map(l => l.toLowerCase());
+  const out = {};
+  const used = new Set();
+  for (const k of keys) {
+    const idx = map[k];
+    if (Number.isInteger(idx) && idx >= 0 && !used.has(idx)) { out[k] = idx; used.add(idx); }
   }
+  for (const k of keys) {
+    if (out[k] !== undefined) continue;
+    let i = 0;
+    while (used.has(i)) i++;
+    out[k] = i; used.add(i);
+  }
+  const next = { ...out };
+  for (const [k, v] of Object.entries(map)) {
+    if (Object.keys(next).length >= 200) break;
+    if (next[k] === undefined) next[k] = v;
+  }
+  writeSetting('trend_colors', JSON.stringify(next));
+  return out;
 }
 
-// GET /api/polls/active — every poll still in the tab (running or showing
-// results), newest first. Up to POLL_MAX_ACTIVE at a time (public).
-app.get('/api/polls/active', (req, res) => {
-  try {
-    // status='open' always counts (a NULL closes_at on a pre-migration row
-    // just means "no deadline yet", not "not in the tab"). A closed poll
-    // only counts while still in its results window - a pre-migration
-    // closed poll has NULL expires_at and must NOT resurface here.
-    const rows = db.prepare(`
-      SELECT id FROM polls
-      WHERE channel = ? AND (status = 'open' OR (expires_at IS NOT NULL AND expires_at > datetime('now')))
-      ORDER BY id DESC
-    `).all(channelOf(req));
-    const userId = optionalUserId(req);
-    res.json({ polls: rows.map(r => buildPollPayload(r.id, userId)) });
-  } catch (err) {
-    console.error('Fetch active polls error:', err);
-    res.status(500).json({ error: 'Failed to fetch polls' });
+// Graph data for the CURRENT taglines only (one that was removed is not drawn),
+// in a compact form - the tagline names once, then one row of counts per
+// refresh - so the push to every viewer stays small. Ordered by the app's run
+// time, not arrival order, so a late retry can't make a line run backwards.
+const TREND_HISTORY_RUNS = 60;
+function readTrendHistory(currentLabels) {
+  const rows = db.prepare(
+    "SELECT payload, refreshed_at FROM meter_snapshots WHERE kind = 'trend' AND refreshed_at >= ? ORDER BY refreshed_at DESC, id DESC LIMIT ?"
+  ).all(Date.now() - METER_MAX_AGE_MS, TREND_HISTORY_RUNS);
+  const keys = currentLabels.map(l => l.toLowerCase());
+  const runs = [];
+  for (const row of rows.reverse()) {
+    try {
+      const counts = new Map((JSON.parse(row.payload).items || []).map(it => [String(it.label).toLowerCase(), it.count]));
+      const c = keys.map(k => (counts.has(k) ? counts.get(k) : null));
+      if (c.some(v => v !== null)) runs.push({ t: row.refreshed_at, c });
+    } catch (e) { /* skip a corrupt row */ }
   }
-});
+  return { labels: currentLabels, runs };
+}
 
-// GET /api/polls/history — recent closed polls with final results (public)
-app.get('/api/polls/history', (req, res) => {
-  try {
-    const rows = db.prepare(`SELECT id FROM polls WHERE channel = ? AND status = 'closed' ORDER BY id DESC LIMIT 10`).all(channelOf(req));
-    res.json({ polls: rows.map(r => buildPollPayload(r.id, null)) });
-  } catch (err) {
-    console.error('Fetch poll history error:', err);
-    res.status(500).json({ error: 'Failed to fetch poll history' });
+// The latest snapshot by the app's run time. Cached: every viewer connection
+// asks for it, and after a restart they all reconnect at once.
+const meterCache = new Map();
+function readLatestMeter(kind) {
+  if (meterCache.has(kind)) return meterCache.get(kind);
+  let data = null;
+  const row = db.prepare('SELECT payload, refreshed_at FROM meter_snapshots WHERE kind = ? ORDER BY refreshed_at DESC, id DESC LIMIT 1').get(kind);
+  if (row) {
+    try {
+      const { readout, ...p } = JSON.parse(row.payload);
+      data = { ...p, items: p.items.map(({ deepLook, trendCheck, ...it }) => it), refreshedAt: row.refreshed_at };
+      if (kind === 'trend') data.historyV2 = readTrendHistory(data.items.map(i => i.label));
+    } catch (e) { data = null; }
   }
-});
+  meterCache.set(kind, data);
+  return data;
+}
+function readAllMeters() { return { trend: readLatestMeter('trend') }; }
 
-// POST /api/polls/:id/vote — cast or change a vote (login required)
-app.post('/api/polls/:id/vote', requireAuth, (req, res) => {
-  try {
-    const pollId = Number(req.params.id);
-    const optionId = Number((req.body || {}).option_id);
-    if (!pollId || !optionId) return res.status(400).json({ error: 'Poll and option are required' });
-
-    const poll = db.prepare(`
-      SELECT *, (status = 'open' AND (closes_at IS NULL OR closes_at > datetime('now'))) AS is_votable
-      FROM polls WHERE id = ?
-    `).get(pollId);
-    if (!poll) return res.status(404).json({ error: 'Poll not found' });
-    // The is_votable check is belt-and-braces alongside sweepPolls(), which
-    // flips status at closes_at on a 60s tick - this closes the gap between
-    // expiry and the next sweep.
-    if (!poll.is_votable) return res.status(409).json({ error: 'This poll is closed' });
-
-    const option = db.prepare('SELECT id FROM poll_options WHERE id = ? AND poll_id = ?').get(optionId, pollId);
-    if (!option) return res.status(400).json({ error: 'That option does not belong to this poll' });
-
-    db.prepare(`
-      INSERT INTO poll_votes (poll_id, option_id, user_id) VALUES (?, ?, ?)
-      ON CONFLICT(poll_id, user_id) DO UPDATE SET option_id = excluded.option_id, created_at = CURRENT_TIMESTAMP
-    `).run(pollId, optionId, req.user.id);
-
-    broadcastPollResults(pollId);
-    res.json({ success: true, poll: buildPollPayload(pollId, req.user.id) });
-  } catch (err) {
-    console.error('Vote error:', err);
-    res.status(500).json({ error: 'Failed to record vote' });
+// Strict on purpose: this is the only write path and its caller is an app on
+// a phone. Anything unexpected is rejected, never "fixed up".
+function validateInsights(v) {
+  if (v === undefined || v === null) return { value: undefined };
+  if (!Array.isArray(v) || v.length > METER_MAX_INSIGHTS) return { error: `insights must be a list of up to ${METER_MAX_INSIGHTS} lines` };
+  const out = [];
+  for (const s of v) {
+    const t = typeof s === 'string' ? normalizeMeterLabel(s) : '';
+    if (!t || t.length > METER_MAX_INSIGHT_LEN) return { error: `each insight must be 1-${METER_MAX_INSIGHT_LEN} characters` };
+    out.push(t);
   }
-});
+  return { value: out.length ? out : undefined };
+}
 
-// POST /api/polls — create a poll and open it (Admin only)
-app.post('/api/polls', requireAuth, requireAdmin, (req, res) => {
-  try {
-    const { question, options } = req.body || {};
-    const cleanQuestion = (question || '').trim();
-    if (!cleanQuestion) return res.status(400).json({ error: 'Question is required' });
-    if (cleanQuestion.length > POLL_MAX_QUESTION_LEN) {
-      return res.status(400).json({ error: `Question must be ${POLL_MAX_QUESTION_LEN} characters or fewer` });
+// ----- AI results on a Trend Tagline run (optional) -----
+// readout: the app's AI read-out of the whole run. deepLook (per tagline): an
+// AI reading of a SAMPLE of posts - never exact figures like the counts.
+// Only the fields below are kept; unknown extra fields inside them are dropped.
+const AI_PROVIDERS = new Set(['openai', 'xai']);
+const AI_TEXT_MAX = 200;
+const AI_MODEL_MAX = 60;
+const X_HANDLE_RE = /^@[A-Za-z0-9_]{1,15}$/;
+const X_POST_URL_RE = /^https:\/\/x\.com\/[A-Za-z0-9_]{1,15}\/status\/\d{5,25}$/;
+const isGiven = (v) => v !== undefined && v !== null;
+
+function aiText(v, name) {
+  const t = typeof v === 'string' ? normalizeMeterLabel(v) : '';
+  if (!t || t.length > AI_TEXT_MAX) return { error: `${name} must be 1-${AI_TEXT_MAX} characters` };
+  return { value: t };
+}
+function aiLines(v, name, min, max) {
+  if (!Array.isArray(v) || v.length < min || v.length > max) return { error: `${name} must be a list of ${min}-${max} lines` };
+  const out = [];
+  for (const s of v) {
+    const t = aiText(s, `${name}: each line`);
+    if (t.error) return t;
+    out.push(t.value);
+  }
+  return { value: out };
+}
+function aiTime(v, name) {
+  const t = typeof v === 'string' ? Date.parse(v) : NaN;
+  return Number.isFinite(t) ? { value: t } : { error: `${name} must be an ISO-8601 time` };
+}
+// provider / model, shared by readout and deepLook.
+function aiSource(v, out, where) {
+  if (isGiven(v.provider)) {
+    if (!AI_PROVIDERS.has(v.provider)) return `${where}.provider must be 'openai' or 'xai'`;
+    out.provider = v.provider;
+  }
+  if (isGiven(v.model)) {
+    const m = typeof v.model === 'string' ? normalizeMeterLabel(v.model) : '';
+    if (!m || m.length > AI_MODEL_MAX) return `${where}.model must be 1-${AI_MODEL_MAX} characters`;
+    out.model = m;
+  }
+  return null;
+}
+
+function validateReadout(v) {
+  if (typeof v !== 'object' || Array.isArray(v)) return { error: 'readout must be an object' };
+  const out = {};
+  const headline = aiText(v.headline, 'readout.headline');
+  if (headline.error) return headline;
+  out.headline = headline.value;
+  if (isGiven(v.insights)) {
+    const r = aiLines(v.insights, 'readout.insights', 1, 5);
+    if (r.error) return r;
+    out.insights = r.value;
+  }
+  if (isGiven(v.momentum)) {
+    const r = aiText(v.momentum, 'readout.momentum');
+    if (r.error) return r;
+    out.momentum = r.value;
+  }
+  const srcErr = aiSource(v, out, 'readout');
+  if (srcErr) return { error: srcErr };
+  if (isGiven(v.writtenAt)) {
+    const r = aiTime(v.writtenAt, 'readout.writtenAt');
+    if (r.error) return r;
+    out.writtenAt = r.value;
+  }
+  return { value: out };
+}
+
+function validateVoices(v, name, withLooks, max = 5) {
+  if (!Array.isArray(v) || v.length > max) return { error: `${name} must be a list of up to ${max} accounts` };
+  const out = [];
+  for (const x of v) {
+    if (!x || typeof x !== 'object' || typeof x.handle !== 'string' || !X_HANDLE_RE.test(x.handle)) {
+      return { error: `${name}: each handle must look like @name (1-15 letters, digits or _)` };
     }
-
-    const cleanOptions = (Array.isArray(options) ? options : [])
-      .map(o => String(o || '').trim())
-      .filter(Boolean)
-      .slice(0, POLL_MAX_OPTIONS);
-
-    if (cleanOptions.length < 2) return res.status(400).json({ error: 'At least 2 options are required' });
-    if (cleanOptions.some(o => o.length > POLL_MAX_OPTION_LEN)) {
-      return res.status(400).json({ error: `Options must be ${POLL_MAX_OPTION_LEN} characters or fewer` });
-    }
-
-    // Up to POLL_MAX_ACTIVE polls can be in the tab at once (running or
-    // showing results). Capacity is checked inside the same transaction as
-    // the insert to avoid a race between the check and the create. The
-    // lifecycle is now purely time-driven: 12h open, then 8h showing
-    // results, then deleted by sweepPolls() - there is no manual close.
-    // Polls belong to the page they are created from, and the limit of
-    // POLL_MAX_ACTIVE applies per page.
-    const channel = channelOf(req);
-    let capacityError = false;
-    const createPoll = db.transaction(() => {
-      const { count } = db.prepare(`
-        SELECT COUNT(*) AS count FROM polls
-        WHERE channel = ? AND (status = 'open' OR (expires_at IS NOT NULL AND expires_at > datetime('now')))
-      `).get(channel);
-      if (count >= POLL_MAX_ACTIVE) {
-        capacityError = true;
-        return null;
+    const one = { handle: x.handle };
+    if (withLooks) {
+      if (isGiven(x.looks)) {
+        if (!Number.isInteger(x.looks) || x.looks < 2 || x.looks > 1000) return { error: `${name}.looks must be a whole number from 2` };
+        one.looks = x.looks;
       }
-      const info = db.prepare(`
-        INSERT INTO polls (question, created_by, channel, closes_at, expires_at)
-        VALUES (?, ?, ?, datetime('now', '+${POLL_RUN_HOURS} hours'), datetime('now', '+${POLL_RUN_HOURS + POLL_RESULTS_HOURS} hours'))
-      `).run(cleanQuestion, req.user.username, channel);
-      const insertOption = db.prepare('INSERT INTO poll_options (poll_id, label, position) VALUES (?, ?, ?)');
-      cleanOptions.forEach((label, i) => insertOption.run(info.lastInsertRowid, label, i));
-      return info.lastInsertRowid;
-    });
-
-    const pollId = createPoll();
-    if (capacityError) {
-      return res.status(409).json({ error: `${POLL_MAX_ACTIVE} polls already in the tab — delete one to make room.` });
+    } else if (isGiven(x.note)) {
+      const r = aiText(x.note, `${name}.note`);
+      if (r.error) return r;
+      one.note = r.value;
     }
-
-    const payload = buildPollPayload(pollId, null);
-    io.to(roomOf(channel)).emit('poll_started', payload);
-    res.json({ success: true, poll: payload });
-  } catch (err) {
-    console.error('Create poll error:', err);
-    res.status(500).json({ error: 'Failed to create poll' });
+    out.push(one);
   }
-});
-
-// DELETE /api/polls/:id (Admin only)
-app.delete('/api/polls/:id', requireAuth, requireAdmin, (req, res) => {
-  try {
-    const pollId = Number(req.params.id);
-    const pollChannel = db.prepare('SELECT channel FROM polls WHERE id = ?').get(pollId)?.channel || 'live';
-    // Children removed explicitly - FK cascade isn't relied on here, matching
-    // how the library folder delete is written.
-    const removePoll = db.transaction(() => {
-      db.prepare('DELETE FROM poll_votes WHERE poll_id = ?').run(pollId);
-      db.prepare('DELETE FROM poll_options WHERE poll_id = ?').run(pollId);
-      return db.prepare('DELETE FROM polls WHERE id = ?').run(pollId);
-    });
-
-    const info = removePoll();
-    if (info.changes === 0) return res.status(404).json({ error: 'Poll not found' });
-
-    io.to(roomOf(pollChannel)).emit('poll_closed', { id: pollId, deleted: true });
-    res.json({ success: true });
-  } catch (err) {
-    console.error('Delete poll error:', err);
-    res.status(500).json({ error: 'Failed to delete poll' });
-  }
-});
-
-// POST /api/polls/:id/end — admin cuts an open poll short RIGHT NOW: declares
-// final results to everyone currently watching (the same poll_closed shape
-// sweepPolls() sends at the normal 12h mark), then deletes it outright
-// instead of leaving it sitting in the results tab for the usual 8h window.
-// Distinct from DELETE /api/polls/:id below, which sends {deleted:true} and
-// makes the poll just vanish with no results shown at all - that route is
-// for "this poll was a mistake", this one is for "call it now".
-app.post('/api/polls/:id/end', requireAuth, requireAdmin, (req, res) => {
-  try {
-    const pollId = Number(req.params.id);
-    const poll = db.prepare('SELECT status FROM polls WHERE id = ?').get(pollId);
-    if (!poll) return res.status(404).json({ error: 'Poll not found' });
-    if (poll.status !== 'open') return res.status(409).json({ error: 'This poll is already closed' });
-
-    // Read while the votes/options rows still exist - buildPollPayload joins
-    // against them, so it must run before the delete below.
-    const finalPayload = buildPollPayload(pollId, null);
-    const pollChannel = finalPayload.channel;
-    finalPayload.status = 'closed';
-    finalPayload.closed_at = new Date().toISOString();
-
-    const removePoll = db.transaction(() => {
-      db.prepare('DELETE FROM poll_votes WHERE poll_id = ?').run(pollId);
-      db.prepare('DELETE FROM poll_options WHERE poll_id = ?').run(pollId);
-      return db.prepare('DELETE FROM polls WHERE id = ?').run(pollId);
-    });
-    removePoll();
-
-    // No {deleted:true} - the frontend's poll_closed handler only removes
-    // the card on that flag, otherwise it renders status:'closed' as final
-    // results (renderPollCard's isClosed branch), which is what we want
-    // here: results stay visible on already-open tabs even though the DB
-    // row is already gone. A fresh page load won't see it (not in history -
-    // the row is deleted, not just status-flipped), which is the "delete"
-    // half of what this route promises.
-    io.to(roomOf(pollChannel)).emit('poll_closed', finalPayload);
-
-    res.json({ success: true, poll: finalPayload });
-  } catch (err) {
-    console.error('End poll error:', err);
-    res.status(500).json({ error: 'Failed to end poll' });
-  }
-});
-
-// Every poll now runs on a fixed clock (open -> results -> gone) instead of
-// being closed by hand, so something has to advance that clock. Runs on the
-// same 60s cadence as the title sweeps; logs only when it actually acted,
-// matching the cleanupOldMessages() house pattern.
-function sweepPolls() {
-  try {
-    const toClose = db.prepare(`
-      SELECT id, channel FROM polls WHERE status = 'open' AND closes_at <= datetime('now')
-    `).all();
-    if (toClose.length > 0) {
-      const closeStmt = db.prepare(`UPDATE polls SET status = 'closed', closed_at = CURRENT_TIMESTAMP WHERE id = ?`);
-      toClose.forEach(({ id, channel }) => {
-        closeStmt.run(id);
-        io.to(roomOf(channel || 'live')).emit('poll_closed', buildPollPayload(id, null));
-      });
-      console.log(`[Poll Sweep] Auto-closed ${toClose.length} poll(s).`);
-    }
-
-    const toDelete = db.prepare(`
-      SELECT id, channel FROM polls WHERE expires_at IS NOT NULL AND expires_at <= datetime('now')
-    `).all();
-    if (toDelete.length > 0) {
-      const removePoll = db.transaction((id) => {
-        db.prepare('DELETE FROM poll_votes WHERE poll_id = ?').run(id);
-        db.prepare('DELETE FROM poll_options WHERE poll_id = ?').run(id);
-        db.prepare('DELETE FROM polls WHERE id = ?').run(id);
-      });
-      toDelete.forEach(({ id, channel }) => {
-        removePoll(id);
-        io.to(roomOf(channel || 'live')).emit('poll_closed', { id, deleted: true });
-      });
-      console.log(`[Poll Sweep] Deleted ${toDelete.length} expired poll(s).`);
-    }
-  } catch (err) {
-    console.error('[Poll Sweep Error]:', err);
-  }
+  return { value: out };
 }
 
-sweepPolls();
-setInterval(sweepPolls, 60 * 1000);
+function validateDeepLook(v, label) {
+  const where = `${label}: deepLook`;
+  if (typeof v !== 'object' || Array.isArray(v)) return { error: `${where} must be an object` };
+  const out = {};
+  const themes = aiLines(v.themes, `${where}.themes`, 1, 5);
+  if (themes.error) return themes;
+  out.themes = themes.value;
+  if (isGiven(v.voices)) {
+    const r = validateVoices(v.voices, `${where}.voices`, false, 10);
+    if (r.error) return r;
+    if (r.value.length) out.voices = r.value;
+  }
+  if (isGiven(v.posts)) {
+    if (!Array.isArray(v.posts) || v.posts.length > 3) return { error: `${where}.posts must be a list of up to 3 links` };
+    if (!v.posts.every(p => typeof p === 'string' && X_POST_URL_RE.test(p))) {
+      return { error: `${where}.posts must be links like https://x.com/<user>/status/<id>` };
+    }
+    if (v.posts.length) out.posts = v.posts.slice();
+  }
+  if (isGiven(v.changes)) {
+    const r = aiText(v.changes, `${where}.changes`);
+    if (r.error) return r;
+    out.changes = r.value;
+  }
+  if (isGiven(v.steadyVoices)) {
+    const r = validateVoices(v.steadyVoices, `${where}.steadyVoices`, true);
+    if (r.error) return r;
+    if (r.value.length) out.steadyVoices = r.value;
+  }
+  if (isGiven(v.starters)) {
+    if (!Array.isArray(v.starters) || v.starters.length > 3) return { error: `${where}.starters must be a list of up to 3 accounts` };
+    const st = [];
+    for (const x of v.starters) {
+      if (!x || typeof x !== 'object' || typeof x.handle !== 'string' || !X_HANDLE_RE.test(x.handle)) return { error: `${where}.starters: each handle must look like @name (1-15 letters, digits or _)` };
+      const one = { handle: x.handle };
+      if (isGiven(x.when)) {
+        const w = typeof x.when === 'string' ? normalizeMeterLabel(x.when) : '';
+        if (!w || w.length > 60) return { error: `${where}.starters.when must be 1-60 characters` };
+        one.when = w;
+      }
+      st.push(one);
+    }
+    if (st.length) out.starters = st;
+  }
+  if (isGiven(v.rivalTaglines)) {
+    const r = aiLines(v.rivalTaglines, `${where}.rivalTaglines`, 0, 5);
+    if (r.error) return r;
+    if (r.value.length) out.rivalTaglines = r.value;
+  }
+  if (isGiven(v.pairedHashtags)) {
+    if (!Array.isArray(v.pairedHashtags) || v.pairedHashtags.length > 8) return { error: `${where}.pairedHashtags must be a list of up to 8 hashtags` };
+    if (!v.pairedHashtags.every(t => typeof t === 'string' && /^#[\p{L}\p{M}\p{N}_]{2,60}$/u.test(t))) return { error: `${where}.pairedHashtags: each must look like #Name (2-60 letters, digits or _)` };
+    if (v.pairedHashtags.length) out.pairedHashtags = v.pairedHashtags.slice();
+  }
+  if (isGiven(v.size)) {
+    if (!['standard', 'max', 'full'].includes(v.size)) return { error: `${where}.size must be 'standard', 'max' or 'full'` };
+    out.size = v.size;
+  }
+  if (isGiven(v.postsRead)) {
+    if (!Number.isInteger(v.postsRead) || v.postsRead < 1 || v.postsRead > 1e6) return { error: `${where}.postsRead must be a whole number from 1` };
+    out.postsRead = v.postsRead;
+  }
+  const srcErr = aiSource(v, out, where);
+  if (srcErr) return { error: srcErr };
+  if (isGiven(v.lookedAt)) {
+    const r = aiTime(v.lookedAt, `${where}.lookedAt`);
+    if (r.error) return r;
+    out.lookedAt = r.value;
+  }
+  return { value: out };
+}
+
+// ----- Trend check on a Trend Tagline (optional; replaces deepLook) -----
+// Exact numbers come from counts; the "sample" numbers are estimates from a
+// paid sample of `sample` posts. A malformed trendCheck is DROPPED (null) and
+// the run is accepted without it; unknown keys inside it are ignored.
+const TC_LAUNCH = new Set(['sudden', 'fast', 'gradual']);
+const TC_STR_MAX = 200;
+const TC_PCT_KEYS = ['retweetPct', 'replyPct', 'quotePct', 'originalPct'];
+const TC_SAMPLE_PCT_KEYS = ['naturalPct', 'botLikePct', 'copyPastePct', 'newAccountPct', 'lowReachPct', 'fanClubPct', 'top10AuthorsPct', 'zeroLikePct', 'indiaPctOfLocated'];
+const isPct = (n) => Number.isInteger(n) && n >= 0 && n <= 100;
+const isCount = (n) => Number.isInteger(n) && n >= 0 && n <= 1e12;
+const tcText = (v) => { const t = typeof v === 'string' ? normalizeMeterLabel(v) : ''; return t && t.length <= TC_STR_MAX ? t : null; };
+function tcTimes(v, max) {
+  if (!Array.isArray(v) || v.length > max) return null;
+  const out = [];
+  for (const x of v) { const t = typeof x === 'string' ? Date.parse(x) : NaN; if (!Number.isFinite(t)) return null; out.push(t); }
+  return out;
+}
+function validateTrendCheck(v) {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return null;
+  const out = {};
+  for (const k of ['rangeStart', 'rangeEnd', 'checkedAt']) {
+    const t = typeof v[k] === 'string' ? Date.parse(v[k]) : NaN;
+    if (!Number.isFinite(t)) return null;
+    out[k] = t;
+  }
+  if (out.rangeEnd < out.rangeStart) return null;
+  if (typeof v.ended !== 'boolean') return null;
+  out.ended = v.ended;
+  for (const k of TC_PCT_KEYS) { if (!isPct(v[k])) return null; out[k] = v[k]; }
+  if (!TC_LAUNCH.has(v.launch)) return null;
+  out.launch = v.launch;
+  const lt = tcText(v.launchText);
+  if (!lt) return null;
+  out.launchText = lt;
+  const waves = tcTimes(v.waves, 48);
+  if (!waves) return null;
+  out.waves = waves;
+
+  // Sample figures (estimates): only kept together with how many posts were read.
+  const hasSampleFigure = [...TC_SAMPLE_PCT_KEYS, 'medianLikes', 'organizers', 'pairedHashtags'].some(k => isGiven(v[k]));
+  if (isGiven(v.sample) || hasSampleFigure) {
+    if (!Number.isInteger(v.sample) || v.sample < 1 || v.sample > 1e6) return null;
+    out.sample = v.sample;
+    for (const k of TC_SAMPLE_PCT_KEYS) { if (isGiven(v[k])) { if (!isPct(v[k])) return null; out[k] = v[k]; } }
+    if (isGiven(v.medianLikes)) { if (!isCount(v.medianLikes)) return null; out.medianLikes = v.medianLikes; }
+    if (isGiven(v.organizers)) {
+      if (!Array.isArray(v.organizers) || v.organizers.length > 10) return null;
+      const org = [];
+      for (const o of v.organizers) {
+        if (!o || typeof o.handle !== 'string' || !X_HANDLE_RE.test(o.handle) || !isCount(o.retweets)) return null;
+        org.push({ handle: o.handle, retweets: o.retweets });
+      }
+      if (org.length) out.organizers = org;
+    }
+    if (isGiven(v.pairedHashtags)) {
+      if (!Array.isArray(v.pairedHashtags) || v.pairedHashtags.length > 10) return null;
+      if (!v.pairedHashtags.every(t => typeof t === 'string' && t.length <= 61 && /^#[\p{L}\p{M}\p{N}_]+$/u.test(t))) return null;
+      if (v.pairedHashtags.length) out.pairedHashtags = v.pairedHashtags.slice();
+    }
+  }
+
+  if (isGiven(v.sentiment)) {
+    const st = v.sentiment;
+    if (!st || typeof st !== 'object' || Array.isArray(st)) return null;
+    const sOut = {};
+    for (const k of ['positive', 'negative', 'neutral']) { if (!isCount(st[k])) return null; sOut[k] = st[k]; }
+    if (!Number.isInteger(st.judged) || st.judged < 1 || st.judged > 1e6) return null;
+    sOut.judged = st.judged;
+    if (isGiven(st.byContestant)) {
+      if (typeof st.byContestant !== 'object' || Array.isArray(st.byContestant)) return null;
+      const names = Object.keys(st.byContestant);
+      if (names.length > 10) return null;
+      const by = {};
+      for (const name of names) {
+        const arr = st.byContestant[name], n = tcText(name);
+        if (!n || !Array.isArray(arr) || arr.length !== 3 || !arr.every(isCount)) return null;
+        by[n] = arr;
+      }
+      if (names.length) sOut.byContestant = by;
+    }
+    if (aiSource(st, sOut, 'sentiment')) return null;
+    out.sentiment = sOut;
+  }
+  return out;
+}
+
+function validateMeterBody(body) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return { error: 'Body must be a JSON object' };
+  const kind = body.kind;
+  if (kind !== 'trend') return { error: "kind must be 'trend'. BOSS METER and Top 5 are no longer accepted." };
+  const maxItems = METER_MAX_ITEMS;
+  if (!Array.isArray(body.items) || body.items.length < 1 || body.items.length > maxItems) {
+    return { error: `items must be 1-${maxItems} entries` };
+  }
+  const items = [];
+  const seen = new Set();
+  for (const it of body.items) {
+    if (!it || typeof it !== 'object') return { error: 'Each item must be an object' };
+    const label = typeof it.label === 'string' ? normalizeMeterLabel(it.label) : '';
+    if (!label || label.length > METER_MAX_LABEL) return { error: `label must be 1-${METER_MAX_LABEL} characters` };
+    if (!Number.isInteger(it.count) || it.count < 0 || it.count > 1e12) return { error: 'count must be an integer from 0 to 1e12' };
+    const key = label.toLowerCase();
+    if (seen.has(key)) return { error: `duplicate label: ${label}` };
+    seen.add(key);
+    const item = { label, count: it.count };
+    const ins = validateInsights(it.insights);
+    if (ins.error) return { error: `${label}: ${ins.error}` };
+    if (ins.value) item.insights = ins.value;
+    // Optional (Trending only): tweets per hour, oldest first, one number per
+    // hour starting at hourlyStart - the app's own 24h graph, so the website
+    // can draw it from a single run instead of one point per refresh.
+    if (it.hourly !== undefined && it.hourly !== null) {
+      if (kind !== 'trend') return { error: 'hourly is only accepted for trend' };
+      if (!Array.isArray(it.hourly) || it.hourly.length < 1 || it.hourly.length > METER_MAX_HOURS) {
+        return { error: `hourly must be 1-${METER_MAX_HOURS} numbers` };
+      }
+      if (!it.hourly.every(v => Number.isInteger(v) && v >= 0 && v <= 1e12)) {
+        return { error: 'hourly values must be integers from 0 to 1e12' };
+      }
+      item.hourly = it.hourly;
+    }
+    if (isGiven(it.trendCheck)) {
+      if (kind !== 'trend') return { error: 'trendCheck is only accepted for trend' };
+      const tc = validateTrendCheck(it.trendCheck);
+      if (tc) item.trendCheck = tc;                          // malformed: dropped, the run is still accepted
+    }
+    if (isGiven(it.deepLook)) {
+      if (kind !== 'trend') return { error: 'deepLook is only accepted for trend' };
+      const dl = validateDeepLook(it.deepLook, label);
+      if (dl.error) return { error: dl.error };
+      item.deepLook = dl.value;
+    }
+    items.push(item);
+  }
+  const out = { kind, items };
+  const runInsights = validateInsights(body.insights);
+  if (runInsights.error) return { error: runInsights.error };
+  if (runInsights.value) out.insights = runInsights.value;
+  if (isGiven(body.readout)) {
+    if (kind !== 'trend') return { error: 'readout is only accepted for trend' };
+    const ro = validateReadout(body.readout);
+    if (ro.error) return { error: ro.error };
+    out.readout = ro.value;
+  }
+  // The app's own run time. A phone clock a little ahead is pulled back to
+  // now; a run older than 7 days is refused (a stale retry must never be
+  // stamped "now" and shown as the latest numbers); no time at all = now.
+  // sentAt keeps the time exactly as the app sent it, so a re-send of the
+  // same run still finds it when the first send was pulled back to now.
+  const now = Date.now();
+  let refreshedAt = now;
+  let sentAt = null;
+  if (body.refreshedAt !== undefined && body.refreshedAt !== null && body.refreshedAt !== '') {
+    refreshedAt = Date.parse(body.refreshedAt);
+    if (!Number.isFinite(refreshedAt)) return { error: 'refreshedAt must be an ISO-8601 time' };
+    if (refreshedAt < now - METER_MAX_AGE_MS) return { error: 'refreshedAt is more than 7 days old' };
+    sentAt = refreshedAt;
+    refreshedAt = Math.min(refreshedAt, now);
+  }
+  out.refreshedAt = refreshedAt;
+  out.sentAt = sentAt;
+  const hasHourly = items.some(i => i.hourly);
+  if (hasHourly) {
+    const start = Date.parse(body.hourlyStart);
+    if (!Number.isFinite(start)) return { error: 'hourlyStart (ISO-8601 time of the first hour) is required with hourly' };
+    const longest = Math.max(...items.map(i => (i.hourly ? i.hourly.length : 0)));
+    // The hours must end around the run time (an hour of slack each way for
+    // a partial current hour and phone clock drift).
+    const end = start + longest * HOUR_MS;
+    if (end > refreshedAt + 2 * HOUR_MS || end < refreshedAt - 2 * HOUR_MS) {
+      return { error: 'hourlyStart plus the number of hours must end near refreshedAt' };
+    }
+    out.hourlyStart = start;
+  } else if (body.hourlyStart !== undefined && body.hourlyStart !== null && body.hourlyStart !== '') {
+    return { error: 'hourlyStart was sent without any hourly numbers' };
+  }
+  return { value: out };
+}
+
+// JSON with object keys sorted, so two payloads compare equal whatever order
+// their fields were added in.
+function stableJson(v) {
+  if (Array.isArray(v)) return '[' + v.map(stableJson).join(',') + ']';
+  if (v && typeof v === 'object') return '{' + Object.keys(v).sort().filter(k => v[k] !== undefined).map(k => JSON.stringify(k) + ':' + stableJson(v[k])).join(',') + '}';
+  return JSON.stringify(v);
+}
+
+// The app sends the same Trend run again each time an AI result is added to
+// it. Such a re-send updates the stored run: everything comes from the newest
+// send, except that a read-out or a tagline's Deep look it does not carry is
+// kept from before (never deleted by omission).
+function findTrendRun(refreshedAt, sentAt) {
+  if (sentAt !== null) {
+    const r = db.prepare("SELECT id, payload, refreshed_at FROM meter_snapshots WHERE kind = 'trend' AND sent_at = ? ORDER BY id DESC LIMIT 1").get(sentAt);
+    if (r) return r;
+  }
+  return db.prepare("SELECT id, payload, refreshed_at FROM meter_snapshots WHERE kind = 'trend' AND refreshed_at = ? ORDER BY id DESC LIMIT 1").get(refreshedAt);
+}
+function mergeTrendResend(stored, data) {
+  const merged = { ...data };
+  if (!merged.readout && stored.readout) merged.readout = stored.readout;
+  const looks = new Map((stored.items || []).filter(i => i.deepLook).map(i => [String(i.label).toLowerCase(), i.deepLook]));
+  const checks = new Map((stored.items || []).filter(i => i.trendCheck).map(i => [String(i.label).toLowerCase(), i.trendCheck]));
+  merged.items = data.items.map(it => {
+    const k = it.label.toLowerCase();
+    let out = it;
+    if (!out.deepLook && looks.has(k)) out = { ...out, deepLook: looks.get(k) };
+    if (!out.trendCheck && checks.has(k)) out = { ...out, trendCheck: checks.get(k) };
+    return out;
+  });
+  return merged;
+}
+
+app.post('/api/meters/publish', meterPublishLimiter, express.json({ limit: '256kb' }), (req, res) => {
+  const key = process.env.METERS_PUBLISH_KEY;
+  if (!key) return res.status(503).json({ error: 'Publishing is not configured' });
+  const header = String(req.headers.authorization || '');
+  const supplied = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
+  const a = Buffer.from(supplied), b = Buffer.from(key);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return res.status(401).json({ error: 'Unauthorized' });
+
+  const { value, error } = validateMeterBody(req.body);
+  if (error) return res.status(400).json({ error });
+  const { kind, refreshedAt, sentAt, ...data } = value;
+
+  if (kind === 'trend') {
+    try {
+      const existing = findTrendRun(refreshedAt, sentAt);
+      if (existing) {
+        let stored;
+        try { stored = JSON.parse(existing.payload); } catch (e) { stored = { items: [] }; }
+        const { colors: oldColors, ...storedData } = stored;
+        const merged = mergeTrendResend(storedData, data);
+        const latestRow = db.prepare("SELECT refreshed_at FROM meter_snapshots WHERE kind = 'trend' ORDER BY refreshed_at DESC, id DESC LIMIT 1").get();
+        const isLatest = !latestRow || existing.refreshed_at >= latestRow.refreshed_at;
+        if (stableJson(merged) === stableJson(storedData)) {
+          return res.json({ ok: true, refreshedAt: existing.refreshed_at, latest: isLatest, duplicate: true });
+        }
+        if (isLatest) merged.colors = assignTrendColors(merged.items.map(i => i.label));
+        else if (oldColors) merged.colors = oldColors;
+        db.prepare('UPDATE meter_snapshots SET payload = ?, received_at = ? WHERE id = ?').run(JSON.stringify(merged), Date.now(), existing.id);
+        meterCache.delete('trend');
+        updatesCache.clear();
+        io.to(roomOf('live')).to(roomOf('episode')).emit('meters_updated', { kind, data: readLatestMeter(kind) });
+        const ai = [merged.readout ? 'read-out' : '', merged.items.filter(i => i.deepLook).length ? merged.items.filter(i => i.deepLook).length + ' deep look(s)' : ''].filter(Boolean).join(', ');
+        console.log(`[Meters] trend run updated in place: ${merged.items.length} items${ai ? ', ' + ai : ''}${isLatest ? '' : ' (older run)'}`);
+        return res.json({ ok: true, refreshedAt: existing.refreshed_at, latest: isLatest, updated: true });
+      }
+    } catch (err) {
+      console.error('[Meters] trend update error:', err);
+      return res.status(500).json({ error: 'Could not save the result' });
+    }
+  }
+
+  try {
+    // A retry of a run the server already has (same run time, same content)
+    // is acknowledged without storing it twice.
+    const same = db.prepare('SELECT payload FROM meter_snapshots WHERE kind = ? AND refreshed_at = ?').all(kind, refreshedAt);
+    const sig = JSON.stringify(data);
+    if (same.some(r => { try { const { colors, ...p } = JSON.parse(r.payload); return JSON.stringify(p) === sig; } catch (e) { return false; } })) {
+      return res.json({ ok: true, refreshedAt, duplicate: true });
+    }
+
+    // Only a run at least as new as the current latest replaces what viewers
+    // see; an older one (a late retry) is kept for the graph only.
+    const latestRow = db.prepare('SELECT refreshed_at FROM meter_snapshots WHERE kind = ? ORDER BY refreshed_at DESC, id DESC LIMIT 1').get(kind);
+    const isLatest = !latestRow || refreshedAt >= latestRow.refreshed_at;
+    if (kind === 'trend' && isLatest) data.colors = assignTrendColors(data.items.map(i => i.label));
+
+    db.prepare('INSERT INTO meter_snapshots (kind, payload, refreshed_at, received_at, sent_at) VALUES (?, ?, ?, ?, ?)')
+      .run(kind, JSON.stringify(data), refreshedAt, Date.now(), sentAt);
+    meterCache.delete(kind);
+    meterCache.delete('trend'); // the graph changes even when an older trend run arrives
+    updatesCache.clear();
+    if (isLatest || kind === 'trend') {
+      io.to(roomOf('live')).to(roomOf('episode')).emit('meters_updated', { kind, data: readLatestMeter(kind) });
+    }
+    console.log(`[Meters] ${kind} published: ${data.items.length} items${isLatest ? '' : ' (older run, graph only)'}`);
+    res.json({ ok: true, refreshedAt, latest: isLatest });
+  } catch (err) {
+    console.error('[Meters] publish error:', err);
+    res.status(500).json({ error: 'Could not save the result' });
+  }
+});
+
+// REST fallback for a page that missed the socket push; gated like the stream.
+app.get('/api/meters/latest', (req, res) => {
+  if (!hasAccessSession(req)) return res.status(403).json({ error: 'valid access session required' });
+  res.set('Cache-Control', 'no-store');
+  res.json(readAllMeters());
+});
+
+setInterval(() => {
+  try { db.prepare('DELETE FROM meter_snapshots WHERE received_at < ?').run(Date.now() - METER_KEEP_MS); meterCache.clear(); updatesCache.clear(); }
+  catch (err) { console.error('[Meters] prune error:', err); }
+}, 60 * 60 * 1000);
+
+// ---------- Home page "Updates" ----------
+// Worked out from what the app already publishes - the Trending runs above -
+// so nothing extra is stored and nothing here ever calls X. Rebuilt on the first request after a change.
+const IST_OFFSET_MS = 330 * 60 * 1000;
+const DAY_MS = 24 * HOUR_MS;
+const TREND_MILESTONES = [10e3, 25e3, 50e3, 100e3, 250e3, 500e3, 1e6, 2.5e6, 5e6, 10e6, 25e6, 50e6, 100e6];
+const updatesCache = new Map();
+
+// The Trending timeline is one day's: it starts at 12:00 PM IST and stays
+// until 12:00 PM IST the next day, when a fresh one begins.
+const TREND_CYCLE_HOUR_IST = 12;
+function trendCycleStart(now) {
+  const ist = now + IST_OFFSET_MS;
+  let start = Math.floor(ist / DAY_MS) * DAY_MS + TREND_CYCLE_HOUR_IST * HOUR_MS;
+  if (ist < start) start -= DAY_MS;
+  return start - IST_OFFSET_MS;
+}
+
+function readRuns(kind, since) {
+  const out = [];
+  const rows = db.prepare('SELECT payload, refreshed_at FROM meter_snapshots WHERE kind = ? AND refreshed_at >= ? ORDER BY refreshed_at, id').all(kind, since);
+  for (const row of rows) {
+    try {
+      const p = JSON.parse(row.payload);
+      if (Array.isArray(p.items) && p.items.length) out.push({ ...p, t: row.refreshed_at });
+    } catch (e) { /* skip a corrupt row */ }
+  }
+  return out;
+}
+
+// Highest count first; equal counts keep the app's order.
+function rankItems(items) {
+  return items.map((it, i) => ({ it, i }))
+    .sort((a, b) => b.it.count - a.it.count || a.i - b.i)
+    .map(({ it }, i) => ({ label: it.label, key: it.label.toLowerCase(), count: it.count, position: i + 1, insights: it.insights, hourly: it.hourly }));
+}
+
+// Who passed whom between two refreshes of the same board.
+function findOvertakes(prevByKey, ranked) {
+  const out = [];
+  for (const a of ranked) {
+    const pa = prevByKey.get(a.key);
+    if (!pa) continue;
+    for (const b of ranked) {
+      const pb = prevByKey.get(b.key);
+      if (pb && pa.position > pb.position && a.position < b.position) out.push([a, b]);
+    }
+  }
+  return out;
+}
+
+function buildTrendUpdates(now) {
+  const cycleStart = trendCycleStart(now);
+  const base = { cycleStart, cycleEnd: cycleStart + DAY_MS, updatedAt: null, summary: null, taglines: [], notes: [], readouts: [] };
+  // Runs older than updates_trend_floor (set by hand, e.g. test runs) are treated as belonging to a finished timeline.
+  const floor = Number(readSetting('updates_trend_floor')) || 0;
+  const runs = readRuns('trend', Math.max(cycleStart, floor));
+  if (!runs.length) return base;
+  let colorMap = {};
+  try { colorMap = JSON.parse(readSetting('trend_colors') || '{}') || {}; } catch (e) { colorMap = {}; }
+
+  const tags = new Map();
+  const notes = [];
+  const seenNotes = new Set();
+  // AI read-outs (one per run) and Deep looks (per tagline) are shown once
+  // each, at the time they were written, even if a later send repeats them.
+  const readouts = [];
+  const seenReadouts = new Set();
+  const leaders = [];
+  let prevByKey = null;
+  for (const run of runs) {
+    const ranked = rankItems(run.items);
+    const byKey = new Map(ranked.map(r => [r.key, r]));
+    const of = ranked.length;
+    for (const r of ranked) {
+      let tg = tags.get(r.key);
+      if (!tg) {
+        tg = {
+          label: r.label, key: r.key, entryNo: tags.size + 1, enteredAt: run.t,
+          entry: { count: r.count, position: r.position, of },
+          board: ranked.filter(o => o.key !== r.key).map(o => ({ key: o.key, count: o.count, position: o.position })),
+          thread: [], milestone: TREND_MILESTONES.filter(m => m <= r.count).length, seen: new Set(), onBoard: true,
+        };
+        tags.set(r.key, tg);
+      } else {
+        if (!tg.onBoard) tg.thread.push({ t: run.t, type: 'back', count: r.count, position: r.position, of });
+        let crossed = null;
+        while (tg.milestone < TREND_MILESTONES.length && r.count >= TREND_MILESTONES[tg.milestone]) crossed = TREND_MILESTONES[tg.milestone++];
+        if (crossed) tg.thread.push({ t: run.t, type: 'milestone', value: crossed, count: r.count });
+      }
+      for (const text of r.insights || []) {
+        if (!tg.seen.has(text)) { tg.seen.add(text); tg.thread.push({ t: run.t, type: 'note', text }); }
+      }
+      const dl = run.items.find(i => i.label.toLowerCase() === r.key)?.deepLook;
+      if (dl) {
+        const sig = 'deepLook\n' + JSON.stringify(dl);
+        if (!tg.seen.has(sig)) { tg.seen.add(sig); tg.thread.push({ t: dl.lookedAt || run.t, type: 'deeplook', runAt: run.t, look: dl }); }
+      }
+      const tc = run.items.find(i => i.label.toLowerCase() === r.key)?.trendCheck;
+      if (tc && (!tg.check || tc.checkedAt >= tg.check.checkedAt)) tg.check = tc;
+      tg.onBoard = true;
+      tg.last = { t: run.t, count: r.count, position: r.position, of };
+      if (Array.isArray(r.hourly) && Number.isFinite(run.hourlyStart)) tg.hourly = { start: run.hourlyStart, values: r.hourly, runAt: run.t };
+    }
+    if (prevByKey) {
+      for (const [a, b] of findOvertakes(prevByKey, ranked)) {
+        tags.get(a.key).thread.push({ t: run.t, type: 'overtook', other: b.label, count: a.count, otherCount: b.count });
+        tags.get(b.key).thread.push({ t: run.t, type: 'overtaken', other: a.label, count: b.count, otherCount: a.count });
+      }
+      for (const [k, p] of prevByKey) {
+        const tg = tags.get(k);
+        if (!byKey.has(k) && tg.onBoard) { tg.onBoard = false; tg.thread.push({ t: run.t, type: 'dropped', count: p.count }); }
+      }
+    }
+    if (!leaders.length || leaders[leaders.length - 1].key !== ranked[0].key) leaders.push({ t: run.t, key: ranked[0].key, label: ranked[0].label });
+    for (const text of run.insights || []) {
+      if (!seenNotes.has(text)) { seenNotes.add(text); notes.push({ t: run.t, text }); }
+    }
+    if (run.readout) {
+      const sig = JSON.stringify(run.readout);
+      if (!seenReadouts.has(sig)) { seenReadouts.add(sig); readouts.push({ ...run.readout, t: run.readout.writtenAt || run.t, runAt: run.t }); }
+    }
+    prevByKey = byKey;
+  }
+
+  const lastRun = runs[runs.length - 1];
+  const board = rankItems(lastRun.items);
+  const boardTotal = board.reduce((s, r) => s + r.count, 0);
+  const colorOf = (key) => (Number.isInteger(colorMap[key]) ? colorMap[key] : null);
+  const taglines = [...tags.values()].map(tg => {
+    const hours = (tg.last.t - tg.enteredAt) / HOUR_MS;
+    const growth = tg.last.count - tg.entry.count;
+    let peakHour = null, lastHour = null;
+    if (tg.hourly) {
+      const { start, values, runAt } = tg.hourly;
+      const current = Math.floor((runAt - start) / HOUR_MS);
+      values.forEach((v, k) => {
+        const hs = start + k * HOUR_MS;
+        if (hs + HOUR_MS <= cycleStart || k > current) return;
+        if (k < current && (!peakHour || v > peakHour.count)) peakHour = { t: hs, count: v };
+        if (k === current - 1) lastHour = { t: hs, count: v };
+      });
+    }
+    const compare = [...tags.values()].filter(o => o.entryNo < tg.entryNo).map(o => {
+      const atEntry = tg.board.find(b => b.key === o.key) || null;
+      return {
+        label: o.label, color: colorOf(o.key),
+        atEntry: atEntry ? { count: atEntry.count, position: atEntry.position } : null,
+        now: { count: o.last.count, position: o.onBoard ? o.last.position : null, onBoard: o.onBoard },
+      };
+    });
+    return {
+      label: tg.label, color: colorOf(tg.key), entryNo: tg.entryNo, enteredAt: tg.enteredAt, entry: tg.entry,
+      now: { t: tg.last.t, count: tg.last.count, position: tg.onBoard ? tg.last.position : null, of: board.length, onBoard: tg.onBoard,
+        share: tg.onBoard && boardTotal > 0 ? Math.round((tg.last.count / boardTotal) * 1000) / 10 : null },
+      growth, perHour: hours >= 0.25 ? Math.round(growth / hours) : null,
+      peakHour, lastHour, compare, thread: tg.thread.slice().sort((a, b) => a.t - b.t),
+      // The app's tweets-per-hour numbers for this tagline (from the newest run
+      // that had them): the home page draws them as the 3D skyline.
+      hourly: tg.hourly ? { start: tg.hourly.start, values: tg.hourly.values, runAt: tg.hourly.runAt } : null,
+      // The newest Trend check for this tagline (exact numbers + sample estimates), or null.
+      check: tg.check || null,
+    };
+  });
+  const fastest = taglines.filter(t => t.now.onBoard && t.lastHour).sort((a, b) => b.lastHour.count - a.lastHour.count)[0] || null;
+  return {
+    ...base,
+    updatedAt: lastRun.t,
+    summary: {
+      leader: { label: board[0].label, count: board[0].count, color: colorOf(board[0].key) },
+      taglines: tags.size, onBoard: board.length, total: boardTotal,
+      leadChanges: Math.max(0, leaders.length - 1),
+      leaders: leaders.map(l => ({ t: l.t, label: l.label, color: colorOf(l.key) })),
+      fastest: fastest ? { label: fastest.label, color: fastest.color, count: fastest.lastHour.count, t: fastest.lastHour.t } : null,
+    },
+    taglines, notes, readouts: readouts.sort((a, b) => a.t - b.t),
+  };
+}
+
+function readUpdates() {
+  const now = Date.now();
+  const key = trendCycleStart(now);
+  if (!updatesCache.has(key)) {
+    updatesCache.clear();
+    updatesCache.set(key, { trend: buildTrendUpdates(now) });
+  }
+  return updatesCache.get(key);
+}
+
+// Public, like the home page it feeds (answers come from an in-memory cache).
+const updatesLimiter = makeLimiter(60 * 1000, 60, 'Too many requests.');
+app.get('/api/updates', updatesLimiter, (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  try { res.json(readUpdates()); }
+  catch (err) {
+    console.error('[Updates] build error:', err);
+    res.status(500).json({ error: 'Could not load updates' });
+  }
+});
 
 // ---------- Clips ----------
 // Cuts an MP4 straight out of the OME LLHLS DVR window with `-c copy` (no
@@ -2869,7 +3412,7 @@ const CLIP_TMP_DIR = '/tmp/streamflix-clips';
 const CLIP_STREAM_NAME = 'stream';
 // Loopback base of a channel's OME application (clips never go through nginx/Cloudflare).
 function clipOrigin(channel) { return `http://127.0.0.1:3333/${CHANNEL_OME_APP[channel]}`; }
-const CLIP_MAX_DURATION_SEC = 60; // was 30 - raised so Share/Download can cover a full Reels/Story-length moment
+const CLIP_MAX_DURATION_SEC = 120; // was 60 (30 before that) - 2 minutes, with the viewer choosing In/Out inside a 2-minute window
 const CLIP_MAX_CONCURRENT = 8;
 const CLIP_MAX_QUEUE_DEPTH = 30;
 // Clips vary 13x in size (a 360p preview vs a 30s 1080p download), so a
@@ -2879,7 +3422,7 @@ const CLIP_MAX_QUEUE_DEPTH = 30;
 // Budgeting by bytes actually served lets a user make many cheap previews OR
 // a few full-quality downloads, whichever they need.
 const CLIP_BYTE_BUDGET_WINDOW_MS = 15 * 60 * 1000;
-const CLIP_BYTE_BUDGET_MAX_BYTES = 300 * 1024 * 1024; // ~9-10 full 60s 1080p clips per 15 min (raised alongside the 60s cap so clip COUNT feels the same as the old 30s/150MB limit)
+const CLIP_BYTE_BUDGET_MAX_BYTES = 300 * 1024 * 1024; // unchanged ceiling: ~4-5 full 120s 1080p clips (or ~9-10 at 60s) per 15 min, so per-viewer data does not grow with the longer cap
 
 fs.mkdirSync(CLIP_TMP_DIR, { recursive: true });
 
@@ -3064,7 +3607,7 @@ class ClipOutOfWindowError extends Error {}
 // live playlist (verified: cutting at 60s/900s/1800s offsets produced
 // byte-identical output every time). Once ffmpeg is operating on a plain
 // local file, input -ss behaves correctly.
-async function buildTrackTempFile(chunklistUrl, startMs, endMs, outPath) {
+async function buildTrackTempFile(chunklistUrl, startMs, endMs, outPath, marginMs = 0) {
   const base = chunklistUrl.slice(0, chunklistUrl.lastIndexOf('/') + 1);
   const res = await fetch(chunklistUrl);
   if (!res.ok) throw new Error(`Chunklist fetch failed: ${res.status}`);
@@ -3077,7 +3620,7 @@ async function buildTrackTempFile(chunklistUrl, startMs, endMs, outPath) {
     throw new ClipOutOfWindowError('Requested range has aged out of the DVR window');
   }
 
-  const selected = segments.filter(s => startMs < s.startMs + s.durSec * 1000 && endMs > s.startMs);
+  const selected = segments.filter(s => startMs - marginMs < s.startMs + s.durSec * 1000 && endMs + marginMs > s.startMs);
   if (selected.length === 0) throw new ClipOutOfWindowError('Requested range not found in DVR window');
 
   const initRes = await fetch(base + initUri);
@@ -3091,7 +3634,71 @@ async function buildTrackTempFile(chunklistUrl, startMs, endMs, outPath) {
   }
 
   fs.writeFileSync(outPath, Buffer.concat(chunks));
-  return { firstSegmentStartMs: selected[0].startMs };
+  return { firstSegmentStartMs: selected[0].startMs, firstSegmentDurSec: selected[0].durSec };
+}
+
+// ---- Clip audio/video sync: READ BEFORE CHANGING THE CUT ----
+// A clip must play in sync in EVERY player, including the ones that ignore
+// MP4 edit lists (many Android players, WhatsApp/Instagram processing, video
+// editors). The old cut used input-side -ss per track: video can only start
+// on a keyframe, so ffmpeg began up to a keyframe interval early and hid that
+// with an edit list - players that ignore it played the sound ~0.45s ahead of
+// the picture (measured on real clips 2026-10-17). It also re-zeroed each
+// track on its own first sample, which adds a further offset whenever the
+// audio and video segments don't start at the same instant.
+// So the cut now:
+//   1. keeps both tracks on the stream's own shared clock (-copyts) - the same
+//      clock every live player uses to keep sound and picture together,
+//   2. starts BOTH tracks at the same real keyframe (no pre-roll, no edit
+//      list to hide one),
+//   3. checks every produced file (clipSyncCheck) and logs the result.
+// Test before/after any change: /root/streamflix-tools/clip-test/av-sync-test.sh
+// Audio can only start on a whole AAC frame (21ms), so a player that ignores
+// edit lists may hear it up to one frame early; people notice ~45ms+.
+const CLIP_SYNC_TOLERANCE_SEC = 0.025;
+
+function ffprobeLines(args) {
+  return new Promise((resolve, reject) => {
+    const p = spawn('/usr/bin/ffprobe', ['-v', 'error', ...args]);
+    let out = '', err = '';
+    p.stdout.on('data', d => { out += d; });
+    p.stderr.on('data', d => { err += d; });
+    p.on('error', reject);
+    p.on('close', code => (code === 0 ? resolve(out.split('\n').filter(Boolean)) : reject(new Error(`ffprobe exited ${code}: ${err.slice(-300)}`))));
+  });
+}
+
+// Packets of the single track in a file, raw stream timestamps, decode order.
+async function probeTrackPackets(file, readSec, sel = '0', ignoreElst = false) {
+  const args = [...(ignoreElst ? ['-ignore_editlist', '1'] : []), '-select_streams', sel,
+    '-show_entries', 'packet=pts_time,dts_time,flags', '-of', 'csv=p=0'];
+  if (readSec) args.push('-read_intervals', `%+${readSec}`);
+  const lines = await ffprobeLines([...args, file]);
+  return lines.map(l => {
+    const [pts, dts, flags] = l.split(',');
+    const p = parseFloat(pts), d = parseFloat(dts);
+    return { pts: p, dts: Number.isFinite(d) ? d : p, key: String(flags || '').includes('K') };
+  }).filter(p => Number.isFinite(p.pts));
+}
+
+// "In sync" means: in the clip, the audio sits exactly where it sat against
+// the video in the stream itself (rawSkew = first audio - first video, on the
+// stream clock). Checked as a player that honours MP4 edit lists sees the
+// file AND as one that ignores them; also that the video opens on a keyframe
+// with no hidden pre-roll.
+async function clipSyncCheck(file, rawSkew) {
+  const first = async (sel, ignoreElst) => {
+    const pk = await probeTrackPackets(file, 1, sel, ignoreElst);
+    return pk.length ? { pts: Math.min(...pk.map(p => p.pts)), key: pk[0].key } : null;
+  };
+  const [v, a, vi, ai] = await Promise.all([first('v:0', false), first('a:0', false), first('v:0', true), first('a:0', true)]);
+  if (!v || !a || !vi || !ai) return { ok: false, why: 'a track is missing' };
+  const skew = a.pts - v.pts, skewIgnoringElst = ai.pts - vi.pts;
+  const ok = v.key && vi.key
+    && v.pts > -0.002 && v.pts < 0.25 && vi.pts > -0.002 && vi.pts < 0.25
+    && Math.abs(skew - rawSkew) <= CLIP_SYNC_TOLERANCE_SEC
+    && Math.abs(skewIgnoringElst - rawSkew) <= CLIP_SYNC_TOLERANCE_SEC;
+  return { ok, videoStart: v.pts, audioStart: a.pts, skew, skewIgnoringElst, rawSkew, startsOnKeyframe: v.key && vi.key };
 }
 
 const CLIP_ALLOWED_QUALITIES = new Set(['preview', '720p', '1080p']);
@@ -3133,25 +3740,58 @@ async function cutAndStreamClip(req, res, { startMs, durationSec, quality, onPro
     const { videoChunklistUrl, audioChunklistUrl } = await getClipSourceChunklists(quality, channel);
     const endMs = startMs + durationSec * 1000;
 
-    // Both tracks are fetched into local files first - ffmpeg then seeks
-    // within plain files, never against the live chunklist URL directly.
+    // Both tracks are fetched into local files first - ffmpeg then works on
+    // plain files, never against the live chunklist URL directly. Audio gets
+    // one segment of margin each side so it always covers the video's span.
     const [videoInfo] = await Promise.all([
       buildTrackTempFile(videoChunklistUrl, startMs, endMs, videoTemp),
-      buildTrackTempFile(audioChunklistUrl, startMs, endMs, audioTemp)
+      buildTrackTempFile(audioChunklistUrl, startMs, endMs, audioTemp, 8000)
     ]);
 
-    // Both chunklists share the same segment timeline (verified: identical
-    // MEDIA-SEQUENCE and segment count, PDTs within 33ms), so the video
-    // track's selected-segment start is used as the seek anchor for both.
-    const ss = Math.max(0, (startMs - videoInfo.firstSegmentStartMs) / 1000);
+    // Map the wall-clock start onto the stream's own clock using the first
+    // video segment (its PROGRAM-DATE-TIME is the time of its first frame),
+    // then start on the last keyframe at or before it - see the sync note above.
+    const vPk = await probeTrackPackets(videoTemp); // whole file: ~0.1s even for 2 min of 1080p
+    if (!vPk.length) throw new Error('No video packets in the clip source');
+    const segRaw = vPk[0].pts;
+    const targetRaw = segRaw + Math.max(0, startMs - videoInfo.firstSegmentStartMs) / 1000;
+    const keys = vPk.filter(p => p.key);
+    let kf = keys.filter(k => k.pts <= targetRaw + 0.001).pop();
+    if (!kf) kf = keys.find(k => k.pts > targetRaw);
+    if (!kf) throw new Error('No keyframe near the clip start');
+    const startRaw = kf.pts;
+    // Cut point = the keyframe's DECODE time (earlier than its display time
+    // when the encoder uses B-frames) minus half a millisecond, so ffmpeg can
+    // never drop the keyframe itself through rounding or B-frame reordering.
+    const cutRaw = Math.min(kf.pts, kf.dts) - 0.0005;
+    // The end also lands just before a keyframe, so the last group of frames
+    // is complete (with B-frames, stopping mid-group drops its last frames).
+    // That can run up to one keyframe interval past the asked end.
+    const endRaw = targetRaw + durationSec;
+    const endKf = keys.find(k => k.pts >= endRaw - 0.001 && k.pts > startRaw);
+    const endCutRaw = endKf ? Math.min(endKf.pts, endKf.dts) - 0.0005
+      : Math.max(...vPk.map(p => p.pts)) + 0.001;
 
+    const aPk = await probeTrackPackets(audioTemp);
+    if (!aPk.length) throw new Error('No audio packets in the clip source');
+    const aFirst = aPk.find(p => p.pts >= cutRaw);
+    if (!aFirst || aFirst.pts > cutRaw + 0.05 || aPk[aPk.length - 1].pts < endRaw - 1) {
+      console.error(`[Clip] audio does not cover the video span (audio ${aPk[0].pts.toFixed(3)}-${aPk[aPk.length - 1].pts.toFixed(3)}, video ${startRaw.toFixed(3)}-${endRaw.toFixed(3)})`);
+    }
+    const rawSkew = aFirst ? aFirst.pts - startRaw : 0;
+
+    // -copyts keeps both inputs on the shared stream clock; the OUTPUT -ss
+    // then drops everything before the cut point on both tracks alike, so the
+    // file opens on the keyframe with no pre-roll and no hidden edit.
     const args = [
       '-hide_banner', '-loglevel', 'error',
-      '-ss', String(ss), '-i', videoTemp,
-      '-ss', String(ss), '-i', audioTemp,
-      '-t', String(durationSec),
+      '-copyts',
+      '-i', videoTemp,
+      '-i', audioTemp,
       '-map', '0:v', '-map', '1:a',
       '-c', 'copy',
+      '-ss', cutRaw.toFixed(6),
+      '-t', (endCutRaw - cutRaw).toFixed(6),
       '-movflags', '+faststart',
       '-y', outFile
     ];
@@ -3172,6 +3812,16 @@ async function cutAndStreamClip(req, res, { startMs, durationSec, quality, onPro
     });
 
     if (!fs.existsSync(outFile)) throw new Error('ffmpeg produced no output');
+
+    try {
+      const sync = await clipSyncCheck(outFile, rawSkew);
+      const msg = `${channel} ${quality} ${durationSec}s: starts ${(targetRaw - startRaw).toFixed(2)}s before the asked start (keyframe), `
+        + `audio vs video ${(sync.skew * 1000).toFixed(0)}ms / ${(sync.skewIgnoringElst * 1000).toFixed(0)}ms ignoring edit lists, stream itself ${(rawSkew * 1000).toFixed(0)}ms`;
+      if (sync.ok) console.log(`[Clip] sync ok: ${msg}`);
+      else console.error(`[Clip] SYNC CHECK FAILED: ${msg} ${JSON.stringify(sync)}`);
+    } catch (e) {
+      console.error('[Clip] sync check could not run:', e.message);
+    }
 
     if (onProduced) onProduced(fs.statSync(outFile).size);
 
@@ -3258,10 +3908,16 @@ const CLIP_QUANTUM_SEC = 2;
 // can never collide with (or be forged from) a live link for the same
 // timestamp - they also sit under a different URL path, which keeps the
 // Cloudflare cache entries apart.
-function clipSignature(startSec, durationSec, quality, channel = 'live') {
+// Version 2 = cut with the keyframe-aligned, shared-clock method (see the
+// sync note at clipSyncCheck). A new version gives every clip a new URL, so
+// Cloudflare (which keeps clip files 24h) can never hand out a file made by
+// the old method for a link signed after the change. Old links still verify.
+const CLIP_SIG_VERSION = 2;
+function clipSignature(startSec, durationSec, quality, channel = 'live', version = CLIP_SIG_VERSION) {
   const suffix = channel === 'live' ? '' : `|${channel}`;
+  const ver = version >= 2 ? `|v${version}` : '';
   return crypto.createHmac('sha256', process.env.CLIP_SIGNING_SECRET)
-    .update(`${startSec}|${durationSec}|${quality}${suffix}`)
+    .update(`${startSec}|${durationSec}|${quality}${suffix}${ver}`)
     .digest('hex')
     .slice(0, 24);
 }
@@ -3279,12 +3935,16 @@ app.post('/api/clips/sign', requireAuth, requireAccessForClips, (req, res) => {
   if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) {
     return res.status(400).json({ error: 'Invalid start/end timestamps' });
   }
-  const durationSec = Math.round((endMs - startMs) / 1000);
-  if (durationSec > CLIP_MAX_DURATION_SEC) {
+  if ((endMs - startMs) / 1000 > CLIP_MAX_DURATION_SEC + 0.5) {
     return res.status(400).json({ error: `Clips are capped at ${CLIP_MAX_DURATION_SEC}s` });
   }
 
   const startSec = Math.floor(startMs / 1000 / CLIP_QUANTUM_SEC) * CLIP_QUANTUM_SEC;
+  // Measured from the grid-aligned start (which can sit up to 2s before the
+  // viewer's start) up to the viewer's END, rounded UP - so the file always
+  // reaches the marked end. It used to be Math.round(end - start), which
+  // ended the clip up to ~2.5s early whenever the start snapped backwards.
+  const durationSec = Math.ceil((endMs - startSec * 1000) / 1000);
   const channel = channelOf(req);
   const sig = clipSignature(startSec, durationSec, quality, channel);
 
@@ -3305,17 +3965,16 @@ async function handleSignedClipGet(req, res, channel) {
   const quality = req.params.quality;
 
   if (!Number.isInteger(startSec) || startSec < 0
-      || !Number.isInteger(durationSec) || durationSec <= 0 || durationSec > CLIP_MAX_DURATION_SEC
+      || !Number.isInteger(durationSec) || durationSec <= 0 || durationSec > CLIP_MAX_DURATION_SEC + CLIP_QUANTUM_SEC + 1
       || !CLIP_ALLOWED_QUALITIES.has(quality)) {
     return res.status(400).json({ error: 'Invalid clip parameters' });
   }
 
-  const expectedSig = clipSignature(startSec, durationSec, quality, channel);
-  const providedSig = String(req.params.sig || '');
-  const expectedBuf = Buffer.from(expectedSig);
-  const providedBuf = Buffer.from(providedSig);
-  const validSig = expectedBuf.length === providedBuf.length
-    && crypto.timingSafeEqual(expectedBuf, providedBuf);
+  const providedBuf = Buffer.from(String(req.params.sig || ''));
+  const validSig = [CLIP_SIG_VERSION, 1].some(v => {
+    const expectedBuf = Buffer.from(clipSignature(startSec, durationSec, quality, channel, v));
+    return expectedBuf.length === providedBuf.length && crypto.timingSafeEqual(expectedBuf, providedBuf);
+  });
   if (!validSig) {
     return res.status(403).json({ error: 'Invalid or expired clip link' });
   }
@@ -3325,6 +3984,239 @@ async function handleSignedClipGet(req, res, channel) {
 
 app.get('/api/clips/:startSec/:durationSec/:quality/:sig.mp4', (req, res) => handleSignedClipGet(req, res, 'live'));
 app.get('/api/clips/episode/:startSec/:durationSec/:quality/:sig.mp4', (req, res) => handleSignedClipGet(req, res, 'episode'));
+
+// ---- Clip window preview (Clip v2) ----
+// The Clip dialog shows the last 2 minutes at 720p so the viewer can mark In
+// and Out. This does NOT cut anything: it hands the browser a frozen (VOD)
+// playlist that points at the SAME public 720p segments every live viewer is
+// already fetching (so they come out of Cloudflare's cache - near-zero origin
+// egress). The final Download/Share still goes through the untouched
+// /api/clips/sign -> signed GET -> cutAndStreamClip path.
+//
+// Why a server-built playlist instead of the live one: a frozen window has a
+// fixed timeline, so the viewer's In/Out marks map to wall-clock times exactly
+// (segment start + offset), with none of the "window slid between two
+// reads" races a live DVR playlist has. Segments are picked by media-sequence
+// number so the video and audio playlists always cover the same segments.
+const CLIP_WINDOW_SEC = 120;
+const CLIP_WINDOW_LINK_TTL_MS = 30 * 60 * 1000;
+// Generous on purpose: Indian mobile carriers put many viewers behind one IP,
+// and every open of the dialog is 4 requests (window + master/video/audio).
+const clipWindowLimiter = makeLimiter(60 * 1000, 240, 'Too many requests. Please try again in a moment.');
+
+// At a big moment many viewers open Clip within seconds of each other, and each
+// open would otherwise make several loopback fetches of a ~120 KB 2-hour
+// chunklist. Identical fetches within 2s share one result (and one in-flight
+// request). Only the preview-window code uses this; the cut path does not.
+const clipWindowTextCache = new Map(); // key -> { at, promise }
+function clipWindowCachedText(key, loader, ttlMs = 2000) {
+  const hit = clipWindowTextCache.get(key);
+  if (hit && Date.now() - hit.at < ttlMs) return hit.promise;
+  const promise = loader();
+  clipWindowTextCache.set(key, { at: Date.now(), promise });
+  promise.catch(() => clipWindowTextCache.delete(key));
+  if (clipWindowTextCache.size > 50) {
+    for (const [k, v] of clipWindowTextCache) if (Date.now() - v.at >= ttlMs) clipWindowTextCache.delete(k);
+  }
+  return promise;
+}
+
+function clipWindowSignature(channel, from, to, exp) {
+  return crypto.createHmac('sha256', process.env.CLIP_SIGNING_SECRET)
+    .update(`win|${channel}|${from}|${to}|${exp}`)
+    .digest('hex')
+    .slice(0, 24);
+}
+
+// Same loopback + Host-header master fetch as getClipSourceChunklists (kept
+// separate on purpose so the cutting path stays exactly as it was).
+async function fetchClipMasterText(channel) {
+  const omeApp = CHANNEL_OME_APP[channel];
+  const signedQuery = signOmeUrl(`/${omeApp}/${CLIP_STREAM_NAME}/llhls.m3u8`, 5 * 60 * 1000).split('?')[1];
+  const masterPath = `/${omeApp}/${CLIP_STREAM_NAME}/llhls.m3u8?${signedQuery}`;
+  return new Promise((resolve, reject) => {
+    const req = http.request({
+      hostname: '127.0.0.1', port: 3333, path: masterPath, method: 'GET',
+      headers: { Host: 'biggboss24hrs.com' }
+    }, (res) => {
+      if (res.statusCode !== 200) {
+        res.resume();
+        return reject(new Error(`Master manifest fetch failed: ${res.statusCode}`));
+      }
+      let body = '';
+      res.on('data', (d) => { body += d; });
+      res.on('end', () => resolve(body));
+    });
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+// 720p if it exists, otherwise the next one up (same rule as the 720p download
+// quality), otherwise the tallest there is.
+async function getClipWindowSources(channel) {
+  const text = await clipWindowCachedText(`master|${channel}`, () => fetchClipMasterText(channel));
+  const lines = text.split('\n').map(l => l.trim());
+  const mediaLine = lines.find(l => l.startsWith('#EXT-X-MEDIA:TYPE=AUDIO'));
+  const audioUri = mediaLine && (mediaLine.match(/URI="([^"]+)"/) || [])[1];
+  const variants = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (!lines[i].startsWith('#EXT-X-STREAM-INF:')) continue;
+    const uri = lines[i + 1];
+    if (!uri || !uri.endsWith('.m3u8')) continue;
+    const m = lines[i].match(/RESOLUTION=(\d+)x(\d+)/);
+    variants.push({ inf: lines[i], uri, height: m ? Number(m[2]) : 0 });
+  }
+  if (!mediaLine || !audioUri || variants.length === 0) {
+    throw new Error('Could not locate video/audio chunklists in master manifest');
+  }
+  const atLeast = variants.filter(v => v.height >= 720);
+  const chosen = atLeast.length
+    ? atLeast.reduce((a, b) => (b.height < a.height ? b : a))
+    : variants.reduce((a, b) => (b.height > a.height ? b : a));
+  const base = `${clipOrigin(channel)}/${CLIP_STREAM_NAME}/`;
+  return { mediaLine, audioUri, variant: chosen, videoUrl: base + chosen.uri, audioUrl: base + audioUri };
+}
+
+// Like parseChunklist but keeps what a playlist rewrite needs: media sequence,
+// per-segment sequence number, discontinuities and init-segment changes.
+function parseChunklistFull(text) {
+  const lines = text.split('\n').map(l => l.trim());
+  const seqMatch = text.match(/#EXT-X-MEDIA-SEQUENCE:(\d+)/);
+  const mediaSequence = seqMatch ? Number(seqMatch[1]) : 0;
+  const versionMatch = text.match(/#EXT-X-VERSION:(\d+)/);
+  const segments = [];
+  let map = null, pdt = null, dur = null, disc = false;
+  for (const line of lines) {
+    if (line.startsWith('#EXT-X-MAP:')) map = (line.match(/URI="([^"]+)"/) || [])[1] || map;
+    else if (line.startsWith('#EXT-X-DISCONTINUITY') && !line.startsWith('#EXT-X-DISCONTINUITY-SEQUENCE')) disc = true;
+    else if (line.startsWith('#EXT-X-PROGRAM-DATE-TIME:')) pdt = new Date(line.slice('#EXT-X-PROGRAM-DATE-TIME:'.length)).getTime();
+    else if (line.startsWith('#EXTINF:')) dur = parseFloat(line.slice('#EXTINF:'.length));
+    else if (line && !line.startsWith('#')) {
+      const prev = segments[segments.length - 1];
+      const durSec = dur != null ? dur : 6;
+      const startMs = pdt != null ? pdt : (prev ? prev.startMs + prev.durSec * 1000 : null);
+      segments.push({ sn: mediaSequence + segments.length, uri: line, startMs, durSec, disc, map });
+      pdt = null; dur = null; disc = false;
+    }
+  }
+  if (segments.length === 0 || segments[0].startMs == null || !segments[0].map) {
+    throw new Error('Could not parse chunklist (missing EXT-X-MAP or timing info)');
+  }
+  return { version: versionMatch ? versionMatch[1] : '6', segments };
+}
+
+async function fetchChunklistFull(url) {
+  const text = await clipWindowCachedText(`cl|${url}`, async () => {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(`Chunklist fetch failed: ${r.status}`);
+    return r.text();
+  });
+  return parseChunklistFull(text);
+}
+
+function clipWindowPublicBase(channel) { return `/${CHANNEL_OME_APP[channel]}/${CLIP_STREAM_NAME}/`; }
+
+// The signed playlist routes: no cookie needed (iPhone's native HLS player
+// does not reliably send them), the HMAC carries the authorisation instead.
+app.post('/api/clips/window', requireAuth, requireAccessForClips, clipWindowLimiter, async (req, res) => {
+  try {
+    const channel = channelOf(req);
+    // Where the viewer is watching. Safari sends the exact wall-clock time of
+    // its playhead (endIso, from video.getStartDate()); hls.js browsers send
+    // how far behind the playlist end they are (behindLiveSec), which on that
+    // path is measured against the same playlist end used below. Safari can't
+    // use the relative form: its "live" position already sits ~3 segments
+    // behind the playlist end, so 0 there would put the window in the
+    // viewer's future.
+    const behindLiveSec = Math.min(7200, Math.max(0, Number(req.body?.behindLiveSec) || 0));
+    const endIsoMs = Date.parse(req.body?.endIso);
+    const src = await getClipWindowSources(channel);
+    const [video, audio] = await Promise.all([fetchChunklistFull(src.videoUrl), fetchChunklistFull(src.audioUrl)]);
+
+    // Both tracks must hold the segment for a sequence number to be offered.
+    const aFirst = audio.segments[0].sn, aLast = audio.segments[audio.segments.length - 1].sn;
+    const vSegs = video.segments.filter(s => s.sn >= aFirst && s.sn <= aLast);
+    if (vSegs.length === 0) throw new ClipOutOfWindowError('Stream window not ready');
+    const last = vSegs[vSegs.length - 1];
+    const liveEndMs = last.startMs + last.durSec * 1000;
+    const endMs = Number.isFinite(endIsoMs) && endIsoMs > liveEndMs - 7200 * 1000
+      ? Math.min(endIsoMs, liveEndMs)
+      : liveEndMs - behindLiveSec * 1000;
+    const startMs = endMs - CLIP_WINDOW_SEC * 1000;
+
+    let sel = vSegs.filter(s => s.startMs + s.durSec * 1000 > startMs && s.startMs < endMs);
+    if (sel.length === 0) throw new ClipOutOfWindowError('Requested range has aged out of the DVR window');
+    // A clip must never straddle an OBS restart (the join would not play),
+    // so the window starts after the most recent one.
+    let restartTrimmed = false;
+    for (let i = sel.length - 1; i > 0; i--) {
+      if (sel[i].disc || sel[i].map !== sel[i - 1].map) { sel = sel.slice(i); restartTrimmed = true; break; }
+    }
+
+    const from = sel[0].sn, to = sel[sel.length - 1].sn;
+    const exp = Date.now() + CLIP_WINDOW_LINK_TTL_MS;
+    const sig = clipWindowSignature(channel, from, to, exp);
+    res.set('Cache-Control', 'no-store');
+    res.json({
+      master: `/api/clips/win/master.m3u8?from=${from}&to=${to}&exp=${exp}&sig=${sig}`,
+      segments: sel.map(s => ({ startMs: s.startMs, durSec: s.durSec })),
+      restartTrimmed
+    });
+  } catch (err) {
+    if (err instanceof ClipOutOfWindowError) return res.status(400).json({ error: err.message });
+    console.error('Clip window error:', err);
+    res.status(500).json({ error: 'Could not open the clip window - the stream may be offline' });
+  }
+});
+
+app.get('/api/clips/win/:kind.m3u8', clipWindowLimiter, async (req, res) => {
+  try {
+    const channel = channelOf(req);
+    const from = Number(req.query.from), to = Number(req.query.to), exp = Number(req.query.exp);
+    const kind = req.params.kind;
+    if (!Number.isInteger(from) || !Number.isInteger(to) || to < from || to - from > 40
+        || !Number.isFinite(exp) || !['master', 'video', 'audio'].includes(kind)) {
+      return res.status(400).send('Invalid request');
+    }
+    const expected = Buffer.from(clipWindowSignature(channel, from, to, exp));
+    const provided = Buffer.from(String(req.query.sig || ''));
+    if (expected.length !== provided.length || !crypto.timingSafeEqual(expected, provided) || exp < Date.now()) {
+      return res.status(403).send('Invalid or expired link');
+    }
+
+    const src = await getClipWindowSources(channel);
+    res.set('Cache-Control', 'no-store');
+    res.set('Content-Type', 'application/vnd.apple.mpegurl');
+    const qs = `from=${from}&to=${to}&exp=${exp}&sig=${req.query.sig}`;
+
+    if (kind === 'master') {
+      const audioLine = src.mediaLine.replace(/URI="[^"]+"/, `URI="/api/clips/win/audio.m3u8?${qs}"`);
+      return res.send(['#EXTM3U', '#EXT-X-VERSION:6', '#EXT-X-INDEPENDENT-SEGMENTS', audioLine,
+        src.variant.inf, `/api/clips/win/video.m3u8?${qs}`, ''].join('\n'));
+    }
+
+    const cl = await fetchChunklistFull(kind === 'video' ? src.videoUrl : src.audioUrl);
+    const sel = cl.segments.filter(s => s.sn >= from && s.sn <= to);
+    if (sel.length !== to - from + 1) return res.status(410).send('Window has aged out');
+    const pub = clipWindowPublicBase(channel);
+    const out = ['#EXTM3U', `#EXT-X-VERSION:${cl.version}`,
+      `#EXT-X-TARGETDURATION:${Math.ceil(Math.max(...sel.map(s => s.durSec)))}`,
+      '#EXT-X-PLAYLIST-TYPE:VOD', '#EXT-X-MEDIA-SEQUENCE:0'];
+    let lastMap = null;
+    for (const s of sel) {
+      if (s.map !== lastMap) { out.push(`#EXT-X-MAP:URI="${pub}${s.map}"`); lastMap = s.map; }
+      out.push(`#EXT-X-PROGRAM-DATE-TIME:${new Date(s.startMs).toISOString()}`);
+      out.push(`#EXTINF:${s.durSec.toFixed(3)},`);
+      out.push(pub + s.uri);
+    }
+    out.push('#EXT-X-ENDLIST', '');
+    res.send(out.join('\n'));
+  } catch (err) {
+    console.error('Clip window playlist error:', err);
+    res.status(502).send('Stream not available');
+  }
+});
 
 // Bound to loopback only - nginx is the sole intended caller (it already
 // proxies here via http://127.0.0.1:4000 in every location block). This
