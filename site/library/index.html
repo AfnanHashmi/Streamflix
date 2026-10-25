@@ -1,0 +1,1892 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+  <meta http-equiv="Pragma" content="no-cache" />
+  <meta http-equiv="Expires" content="0" />
+  <title>Library — Streamflix</title>
+  <meta name="description" content="Watch recorded shows, episodes, and stream playlists on Streamflix.">
+  <meta name="theme-color" content="#000000">
+  <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png">
+  <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16.png">
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,300..800;1,14..32,300..800&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <style>
+    /* ============================================================
+       STREAMFLIX DESIGN SYSTEM — shared tokens (Home / Live / Library)
+       ============================================================ */
+    :root {
+      /* canvas */
+      --stage: #000000;
+      --stage-2: #0a0a0c;
+      --elevated: #141416;
+      --surface: rgba(255, 255, 255, 0.055);
+      --surface-2: rgba(255, 255, 255, 0.09);
+
+      /* glass chrome */
+      --glass: rgba(12, 12, 14, 0.72);
+      --glass-border: rgba(255, 255, 255, 0.10);
+      --glass-hover: rgba(255, 255, 255, 0.10);
+      --hairline: rgba(255, 255, 255, 0.08);
+      --card-border: rgba(255, 255, 255, 0.08);
+      --card-bg: rgba(20, 20, 22, 0.6);
+
+      /* type */
+      --text: #f5f5f7;
+      --text-dim: #a1a1a6;
+      --text-mute: #6e6e73;
+
+      /* accent — restrained, Apple-style */
+      --accent: #2997ff;
+      --accent-soft: rgba(41, 151, 255, 0.16);
+      --live: #ff3b30;
+      --live-soft: rgba(255, 59, 48, 0.14);
+      --apple-red-light: #ff6961;
+      --gold: #d8ae44;
+
+      /* legacy aliases — kept so older rules and JS-injected inline
+         styles keep resolving instead of silently falling back */
+      --cyan: #2997ff;
+      --blue: #2997ff;
+      --purple: #5e5ce6;
+      --pink: #ff3b30;
+      --x-blue: #1d9bf0;
+      --google-blue: #4285f4;
+
+      /* motion — 180-260ms band */
+      --ease: cubic-bezier(.32, .72, 0, 1);
+      --ease-out: cubic-bezier(.16, 1, .3, 1);
+      --dur: 240ms;
+      --dur-fast: 180ms;
+
+      /* shape + depth */
+      --r-sm: 10px;
+      --r-md: 16px;
+      --r-lg: 22px;
+      --r-xl: 28px;
+      --shadow-1: 0 1px 2px rgba(0, 0, 0, .4);
+      --shadow-2: 0 8px 30px rgba(0, 0, 0, .5);
+      --shadow-3: 0 24px 70px rgba(0, 0, 0, .65);
+
+      /* type families — unified across all three pages */
+      --font-main: 'Inter', -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', sans-serif;
+      --font-heading: 'Inter', -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', sans-serif;
+      --font-mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+
+      --nav-h: 66px;
+      --gutter: clamp(20px, 5vw, 56px);
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html { scroll-behavior: smooth; -webkit-text-size-adjust: 100%; }
+
+    body {
+      background: var(--stage);
+      color: var(--text);
+      font-family: var(--font-main);
+      font-feature-settings: 'ss01', 'cv05';
+      overflow-x: hidden;
+      min-height: 100vh;
+      letter-spacing: -0.011em;
+      display: flex;
+      flex-direction: column;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+    }
+
+    .mono { font-family: var(--font-mono); letter-spacing: 0; }
+    .grotesk { font-family: var(--font-heading); letter-spacing: -0.022em; }
+    a { text-decoration: none; color: inherit; }
+
+    ::selection { background: var(--accent-soft); color: #fff; }
+
+    :focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 3px;
+      border-radius: 4px;
+    }
+
+    /* ── ambient canvas ───────────────────────────────────────── */
+    .bg-field {
+      position: fixed;
+      inset: 0;
+      z-index: 0;
+      background:
+        radial-gradient(1100px 620px at 50% -12%, rgba(41, 151, 255, .09) 0%, transparent 62%),
+        radial-gradient(900px 560px at 88% 4%, rgba(94, 92, 230, .06) 0%, transparent 60%),
+        var(--stage);
+      pointer-events: none;
+    }
+
+    .grid-overlay {
+      position: absolute;
+      inset: 0;
+      background: radial-gradient(ellipse 120% 80% at 50% 0%, transparent 45%, rgba(0, 0, 0, .5) 100%);
+    }
+
+    /* ── navigation (identical chrome to index.html / live) ──────── */
+    /* Translucent WHITE tint instead of var(--glass) (a dark scrim tint) -
+       see index.html's nav rule for why: dark-over-black reads as flat,
+       white-over-black reads as glass. */
+    nav {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      z-index: 100;
+      height: var(--nav-h);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 24px;
+      padding: 0 var(--gutter);
+      background: rgba(255, 255, 255, .05);
+      border-bottom: 1px solid rgba(255, 255, 255, .12);
+      backdrop-filter: blur(24px) saturate(180%) brightness(1.1);
+      -webkit-backdrop-filter: blur(24px) saturate(180%) brightness(1.1);
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, .09);
+      transition: background var(--dur) var(--ease), border-color var(--dur) var(--ease);
+    }
+
+    .logo {
+      display: flex;
+      align-items: center;
+      font-family: var(--font-heading);
+      font-weight: 600;
+      font-size: 19px;
+      letter-spacing: -0.03em;
+      color: var(--text);
+      flex-shrink: 0;
+      transition: opacity var(--dur-fast) var(--ease);
+    }
+    .logo:hover { opacity: .72; }
+
+    .logo-x {
+      font-weight: 700;
+      font-style: italic;
+      letter-spacing: -0.08em;
+      color: var(--accent);
+      font-size: 22px;
+      margin: 0 0 0 1px;
+    }
+
+    .nav-links {
+      display: flex;
+      gap: 34px;
+      list-style: none;
+      margin: 0 auto;
+    }
+
+    .nav-links li { position: relative; }
+
+    .nav-links li a,
+    .nav-links .nav-link {
+      display: inline-block;
+      font-size: 13px;
+      font-weight: 500;
+      letter-spacing: -0.005em;
+      color: var(--text-dim);
+      cursor: pointer;
+      text-decoration: none;
+      padding: 4px 0;
+      transition: color var(--dur-fast) var(--ease);
+    }
+
+    .nav-links li::after {
+      content: '';
+      position: absolute;
+      left: 50%;
+      bottom: -6px;
+      height: 1.5px;
+      width: 0;
+      background: var(--text);
+      border-radius: 2px;
+      transform: translateX(-50%);
+      transition: width var(--dur) var(--ease), background-color var(--dur) var(--ease);
+    }
+
+    .nav-links li:hover::after { width: 60%; background: var(--text-dim); }
+    .nav-links li.active::after { width: 100%; background: var(--text); }
+
+    .nav-links li a:hover,
+    .nav-links .nav-link:hover,
+    .nav-links li.active a,
+    .nav-links li.active .nav-link { color: var(--text); }
+
+    .nav-right {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-shrink: 0;
+    }
+
+    .btn-ghost {
+      padding: 7px 16px;
+      border: 1px solid var(--glass-border);
+      border-radius: 9999px;
+      font-size: 12.5px;
+      font-weight: 500;
+      font-family: inherit;
+      color: var(--text);
+      background: var(--surface);
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      transition: background-color var(--dur-fast) var(--ease),
+                  border-color var(--dur-fast) var(--ease),
+                  transform var(--dur-fast) var(--ease);
+    }
+    .btn-ghost:hover { background: var(--surface-2); border-color: rgba(255, 255, 255, .2); }
+    .btn-ghost:active { transform: scale(.97); }
+
+    .btn-solid {
+      padding: 7px 18px;
+      border: 1px solid transparent;
+      border-radius: 9999px;
+      font-size: 12.5px;
+      font-weight: 600;
+      font-family: inherit;
+      color: #000;
+      background: var(--text);
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      transition: opacity var(--dur-fast) var(--ease), transform var(--dur-fast) var(--ease);
+    }
+    .btn-solid:hover { opacity: .85; }
+    .btn-solid:active { transform: scale(.97); }
+
+    .user-badge {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      font-size: 13px;
+    }
+
+    .user-name {
+      color: var(--text-dim);
+      font-size: 13px;
+      font-weight: 450;
+      white-space: nowrap;
+    }
+
+    .btn-logout {
+      padding: 6px 14px;
+      border: 1px solid var(--glass-border);
+      border-radius: 9999px;
+      font-size: 12px;
+      font-weight: 500;
+      font-family: inherit;
+      color: var(--text-dim);
+      background: transparent;
+      cursor: pointer;
+      transition: color var(--dur-fast) var(--ease),
+                  border-color var(--dur-fast) var(--ease),
+                  background-color var(--dur-fast) var(--ease);
+    }
+
+    .btn-logout:hover {
+      color: var(--apple-red-light);
+      border-color: rgba(255, 105, 97, .45);
+      background: var(--live-soft);
+    }
+
+    /* ── main container ───────────────────────────────────────── */
+    main {
+      position: relative;
+      z-index: 2;
+      width: min(94%, 1280px);
+      margin: calc(var(--nav-h) + 48px) auto 60px;
+      flex: 1;
+    }
+
+    /* ── breadcrumb & header bar ──────────────────────────────── */
+    .library-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 40px;
+      flex-wrap: wrap;
+      gap: 16px;
+    }
+
+    .breadcrumb {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 13px;
+      color: var(--text-dim);
+      letter-spacing: -0.006em;
+    }
+
+    .breadcrumb a {
+      color: var(--text-dim);
+      font-weight: 500;
+      transition: color var(--dur-fast) var(--ease);
+    }
+
+    .breadcrumb a:hover { color: var(--text); }
+    .breadcrumb .sep { opacity: 0.4; }
+
+    .header-actions {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .btn-admin-action {
+      padding: 9px 20px;
+      border-radius: 9999px;
+      font-size: 13px;
+      font-weight: 600;
+      font-family: inherit;
+      color: #000;
+      background: var(--text);
+      border: none;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      transition: opacity var(--dur-fast) var(--ease), transform var(--dur-fast) var(--ease);
+    }
+
+    .btn-admin-action:hover {
+      opacity: .85;
+      transform: translateY(-1px);
+    }
+
+    /* ── title banner ─────────────────────────────────────────── */
+    .title-section {
+      text-align: center;
+      margin-bottom: 52px;
+    }
+
+    .title-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 14px;
+      border-radius: 9999px;
+      background: var(--surface);
+      border: 1px solid var(--glass-border);
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--text-dim);
+      letter-spacing: .1em;
+      text-transform: uppercase;
+      margin-bottom: 18px;
+    }
+
+    .title-badge .dot {
+      width: 6px; height: 6px; border-radius: 50%;
+      background: var(--accent); box-shadow: 0 0 8px var(--accent);
+    }
+
+    .title-section h1 {
+      font-family: var(--font-heading);
+      font-size: clamp(34px, 5vw, 56px);
+      font-weight: 700;
+      letter-spacing: -0.038em;
+      line-height: 1.06;
+      margin-bottom: 14px;
+      color: var(--text);
+    }
+
+    .title-section h1 .highlight { color: var(--accent); }
+
+    .title-section p {
+      color: var(--text-dim);
+      font-size: 15.5px;
+      max-width: 580px;
+      margin: 0 auto;
+      line-height: 1.55;
+      letter-spacing: -0.01em;
+    }
+
+    /* ── grid ──────────────────────────────────────────────────── */
+    .cards-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+      gap: 22px;
+    }
+
+    /* ── folder card ──────────────────────────────────────────── */
+    .folder-card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: var(--r-lg);
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      backdrop-filter: blur(20px);
+      -webkit-backdrop-filter: blur(20px);
+      cursor: pointer;
+      position: relative;
+      transition: transform var(--dur) var(--ease),
+                  border-color var(--dur) var(--ease),
+                  box-shadow var(--dur) var(--ease);
+    }
+
+    .folder-card:hover {
+      transform: translateY(-4px) scale(1.015);
+      border-color: rgba(255, 255, 255, .2);
+      box-shadow: var(--shadow-2);
+      z-index: 3;
+    }
+
+    .folder-thumb-wrap {
+      position: relative;
+      width: 100%;
+      padding-top: 56.25%;
+      background: var(--elevated);
+      overflow: hidden;
+    }
+
+    .folder-thumb {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      transition: transform 500ms var(--ease);
+    }
+
+    .folder-card:hover .folder-thumb { transform: scale(1.06); }
+
+    .folder-thumb-wrap::after {
+      content: '';
+      position: absolute;
+      inset: 0;
+      background: linear-gradient(to top, rgba(0, 0, 0, .55) 0%, transparent 45%);
+      pointer-events: none;
+    }
+
+    .folder-count-badge {
+      position: absolute;
+      top: 12px;
+      right: 12px;
+      background: rgba(0, 0, 0, .55);
+      border: 1px solid rgba(255, 255, 255, .14);
+      backdrop-filter: blur(10px);
+      -webkit-backdrop-filter: blur(10px);
+      padding: 4px 11px;
+      border-radius: 9999px;
+      font-size: 11.5px;
+      font-weight: 600;
+      color: var(--text);
+      z-index: 2;
+    }
+
+    .folder-body {
+      padding: 20px;
+      display: flex;
+      flex-direction: column;
+      flex: 1;
+    }
+
+    .folder-title {
+      font-family: var(--font-heading);
+      font-size: 17px;
+      font-weight: 600;
+      letter-spacing: -0.018em;
+      color: var(--text);
+      margin-bottom: 7px;
+    }
+
+    .folder-desc {
+      font-size: 13px;
+      color: var(--text-dim);
+      line-height: 1.5;
+      margin-bottom: 16px;
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+    }
+
+    .folder-footer {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-top: auto;
+      padding-top: 14px;
+      border-top: 1px solid var(--hairline);
+    }
+
+    .open-folder-link {
+      color: var(--text-dim);
+      font-size: 12.5px;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      transition: color var(--dur-fast) var(--ease);
+    }
+
+    .folder-card:hover .open-folder-link { color: var(--text); }
+
+    .delete-item-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      background: transparent;
+      border: 1px solid var(--glass-border);
+      color: var(--text-mute);
+      padding: 4px 10px;
+      border-radius: 8px;
+      font-size: 11.5px;
+      font-weight: 600;
+      font-family: inherit;
+      cursor: pointer;
+      transition: color var(--dur-fast) var(--ease),
+                  border-color var(--dur-fast) var(--ease),
+                  background-color var(--dur-fast) var(--ease);
+    }
+
+    /* Trash icon via masked pseudo-element, replacing the emoji - see
+       .viewer-count::before in live/index.html for the same pattern. */
+    .delete-item-btn::before {
+      content: '';
+      width: 11px;
+      height: 11px;
+      flex-shrink: 0;
+      background-color: currentColor;
+      -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3 6h18'/%3E%3Cpath d='M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2'/%3E%3Cpath d='M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6'/%3E%3Cpath d='M10 11v6M14 11v6'/%3E%3C/svg%3E");
+      mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3 6h18'/%3E%3Cpath d='M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2'/%3E%3Cpath d='M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6'/%3E%3Cpath d='M10 11v6M14 11v6'/%3E%3C/svg%3E");
+      -webkit-mask-size: contain;
+      mask-size: contain;
+      -webkit-mask-repeat: no-repeat;
+      mask-repeat: no-repeat;
+    }
+
+    .delete-item-btn:hover {
+      color: var(--apple-red-light);
+      border-color: rgba(255, 105, 97, .4);
+      background: var(--live-soft);
+    }
+
+    /* ── video card ───────────────────────────────────────────── */
+    .video-card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: var(--r-md);
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      backdrop-filter: blur(20px);
+      -webkit-backdrop-filter: blur(20px);
+      position: relative;
+      transition: transform var(--dur) var(--ease),
+                  border-color var(--dur) var(--ease),
+                  box-shadow var(--dur) var(--ease);
+    }
+
+    .video-card:hover {
+      transform: translateY(-4px) scale(1.015);
+      border-color: rgba(255, 255, 255, .18);
+      box-shadow: var(--shadow-2);
+      z-index: 3;
+    }
+
+    .video-thumb-wrap {
+      position: relative;
+      width: 100%;
+      padding-top: 56.25%;
+      background: var(--elevated);
+      overflow: hidden;
+    }
+
+    .video-thumb {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      transition: transform 500ms var(--ease);
+    }
+
+    .video-card:hover .video-thumb { transform: scale(1.06); }
+
+    .play-overlay {
+      position: absolute;
+      inset: 0;
+      background: rgba(0, 0, 0, .38);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      opacity: 0;
+      transition: opacity var(--dur) var(--ease);
+    }
+
+    .video-card:hover .play-overlay { opacity: 1; }
+
+    .play-btn-circle {
+      width: 50px;
+      height: 50px;
+      border-radius: 50%;
+      background: rgba(255, 255, 255, .92);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: #000;
+      transform: scale(.82);
+      transition: transform var(--dur) var(--ease-out);
+    }
+
+    .video-card:hover .play-btn-circle { transform: scale(1); }
+    .play-btn-circle svg { width: 20px; height: 20px; fill: currentColor; margin-left: 3px; }
+
+    .video-body {
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      flex: 1;
+    }
+
+    .video-title {
+      font-family: var(--font-heading);
+      font-size: 15px;
+      font-weight: 600;
+      letter-spacing: -0.012em;
+      color: var(--text);
+      margin-bottom: 6px;
+      line-height: 1.35;
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+    }
+
+    .video-desc {
+      font-size: 12.5px;
+      color: var(--text-dim);
+      line-height: 1.5;
+      margin-bottom: 14px;
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+    }
+
+    .video-footer {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-top: auto;
+    }
+
+    .btn-play-action {
+      padding: 7px 14px;
+      border-radius: var(--r-sm);
+      background: var(--surface);
+      border: 1px solid var(--glass-border);
+      color: var(--text);
+      font-size: 12px;
+      font-weight: 600;
+      font-family: inherit;
+      cursor: pointer;
+      transition: background-color var(--dur-fast) var(--ease);
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .btn-play-action:hover { background: var(--surface-2); }
+
+    /* ── empty state ──────────────────────────────────────────── */
+    .empty-state {
+      grid-column: 1 / -1;
+      text-align: center;
+      padding: 72px 20px;
+      background: var(--surface);
+      border: 1px dashed var(--glass-border);
+      border-radius: var(--r-lg);
+      color: var(--text-dim);
+    }
+
+    .empty-state h3 {
+      font-family: var(--font-heading);
+      color: var(--text);
+      font-size: 19px;
+      font-weight: 600;
+      margin-bottom: 8px;
+    }
+
+    /* ── modals ───────────────────────────────────────────────── */
+    /* NOTE: modal open/close is inline style.display = 'flex'/'none',
+       and Escape/backdrop-click logic string-compares 'flex'. Default
+       stays display:none; never move the open state onto a class. */
+    .modal-overlay {
+      position: fixed;
+      inset: 0;
+      z-index: 1000;
+      background: rgba(0, 0, 0, .68);
+      backdrop-filter: blur(22px) saturate(140%);
+      -webkit-backdrop-filter: blur(22px) saturate(140%);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }
+
+    .modal-container {
+      background: rgba(20, 20, 22, .92);
+      border: 1px solid var(--glass-border);
+      border-radius: var(--r-xl);
+      width: min(100%, 960px);
+      overflow: hidden;
+      box-shadow: var(--shadow-3);
+      backdrop-filter: blur(30px) saturate(160%);
+      -webkit-backdrop-filter: blur(30px) saturate(160%);
+      animation: modalSlideUp 320ms var(--ease-out);
+    }
+
+    .mode-toggle-group {
+      display: inline-flex;
+      background: var(--surface);
+      border: 1px solid var(--glass-border);
+      border-radius: 9999px;
+      padding: 3px;
+      gap: 3px;
+    }
+
+    .mode-btn {
+      padding: 5px 13px;
+      border-radius: 9999px;
+      border: none;
+      background: transparent;
+      color: var(--text-dim);
+      font-size: 11.5px;
+      font-weight: 600;
+      font-family: inherit;
+      cursor: pointer;
+      transition: background-color var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
+    }
+
+    .mode-btn.active {
+      background: var(--text);
+      color: #000;
+    }
+
+    .admin-form-modal {
+      background: rgba(20, 20, 22, .95);
+      border: 1px solid var(--glass-border);
+      border-radius: var(--r-xl);
+      width: min(100%, 520px);
+      padding: 30px;
+      box-shadow: var(--shadow-3);
+      backdrop-filter: blur(30px);
+      -webkit-backdrop-filter: blur(30px);
+      animation: modalSlideUp 320ms var(--ease-out);
+    }
+
+    @keyframes modalSlideUp {
+      from { transform: translateY(20px) scale(.98); opacity: 0; }
+      to { transform: none; opacity: 1; }
+    }
+
+    .modal-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 18px 24px;
+      border-bottom: 1px solid var(--hairline);
+    }
+
+    .modal-title {
+      font-family: var(--font-heading);
+      font-size: 15.5px;
+      font-weight: 600;
+      letter-spacing: -0.015em;
+    }
+
+    .close-modal-btn {
+      background: var(--surface);
+      border: none;
+      color: var(--text-dim);
+      font-size: 18px;
+      width: 28px;
+      height: 28px;
+      border-radius: 50%;
+      cursor: pointer;
+      line-height: 1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: background-color var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
+    }
+
+    .close-modal-btn:hover { background: var(--surface-2); color: var(--text); }
+
+    .modal-video-frame {
+      width: 100%;
+      aspect-ratio: 16 / 9;
+      background: #000;
+      position: relative;
+    }
+
+    .modal-video-frame iframe {
+      width: 100%;
+      height: 100%;
+      border: none;
+    }
+
+    .modal-body { padding: 24px; }
+
+    .modal-body-title {
+      font-family: var(--font-heading);
+      font-size: 19px;
+      font-weight: 700;
+      letter-spacing: -0.022em;
+      margin-bottom: 8px;
+    }
+
+    .modal-body-desc {
+      font-size: 13.5px;
+      color: var(--text-dim);
+      line-height: 1.6;
+    }
+
+    .form-group {
+      display: flex;
+      flex-direction: column;
+      gap: 7px;
+      margin-bottom: 16px;
+    }
+
+    .form-label {
+      font-size: 12px;
+      color: var(--text-dim);
+      font-weight: 500;
+    }
+
+    .form-input {
+      background: rgba(255, 255, 255, .05);
+      border: 1px solid var(--glass-border);
+      border-radius: var(--r-sm);
+      padding: 12px 15px;
+      color: var(--text);
+      font-size: 13.5px;
+      outline: none;
+      transition: border-color var(--dur-fast) var(--ease),
+                  background-color var(--dur-fast) var(--ease),
+                  box-shadow var(--dur-fast) var(--ease);
+      font-family: inherit;
+    }
+    .form-input::placeholder { color: var(--text-mute); }
+
+    .form-input:focus {
+      border-color: var(--accent);
+      background: rgba(255, 255, 255, .07);
+      box-shadow: 0 0 0 3px var(--accent-soft);
+    }
+
+    /* ── footer ───────────────────────────────────────────────── */
+    footer {
+      position: relative;
+      z-index: 2;
+      border-top: 1px solid var(--hairline);
+      padding: 28px 24px;
+      text-align: center;
+      color: var(--text-mute);
+      font-size: 12.5px;
+      margin-top: auto;
+      background: rgba(0, 0, 0, .5);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+    }
+
+    /* ── responsive ───────────────────────────────────────────── */
+    @media (max-width: 768px) {
+      :root { --nav-h: 58px; }
+      nav { padding: 0 18px; gap: 12px; }
+      .nav-links { display: none; }
+      .cards-grid { grid-template-columns: 1fr; }
+      main { margin-top: calc(var(--nav-h) + 32px); }
+    }
+
+    /* ── accessibility ────────────────────────────────────────── */
+    @media (prefers-reduced-motion: reduce) {
+      html { scroll-behavior: auto; }
+      *, *::before, *::after {
+        animation-duration: .001ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: .001ms !important;
+      }
+    }
+  </style>
+</head>
+<body>
+
+  <div class="bg-field">
+    <div class="grid-overlay"></div>
+  </div>
+
+  <!-- NAVIGATION BAR -->
+  <nav>
+    <a href="/" class="logo">Streamflix<span class="logo-x">X</span></a>
+
+    <ul class="nav-links">
+      <li><a href="/" class="nav-link">Home</a></li>
+      <li><a href="/live/" class="nav-link">Live</a></li>
+      <li class="active"><a href="/library/" class="nav-link">Library</a></li>
+    </ul>
+
+    <div class="nav-right" id="navAuthSection">
+      <button class="btn-ghost" onclick="window.location.href='/login.html'">Log In</button>
+      <button class="btn-solid" onclick="window.location.href='/signup.html'">Sign Up</button>
+    </div>
+  </nav>
+
+  <!-- MAIN CONTAINER -->
+  <main>
+    <!-- TOP HEADER & BREADCRUMB -->
+    <section class="library-header">
+      <div class="breadcrumb" id="breadcrumbNav">
+        <span id="rootBreadcrumb">Library</span>
+      </div>
+
+      <div class="header-actions" id="adminHeaderActions">
+        <!-- Rendered dynamically for Admin accounts -->
+      </div>
+    </section>
+
+    <!-- TITLE BANNER -->
+    <section class="title-section" id="titleSection">
+      <div class="title-badge">
+        <span class="dot"></span>
+        Stream & Show Vault
+      </div>
+      <h1 id="pageHeading">Show <span class="highlight">Folders</span></h1>
+      <p id="pageSubheading">Browse show playlists and stream folders.</p>
+    </section>
+
+    <!-- GRID CONTAINER -->
+    <section class="cards-grid" id="mainGrid">
+      <!-- Folder or Video cards injected by JavaScript -->
+    </section>
+  </main>
+
+  <!-- VIDEO PLAYER MODAL -->
+  <div class="modal-overlay" id="videoModal">
+    <div class="modal-container">
+      <div class="modal-header">
+        <span class="modal-title" id="modalHeaderTitle">Playback VOD</span>
+        <button class="close-modal-btn" onclick="closeVideoModal()">&times;</button>
+      </div>
+      <div class="modal-video-frame" id="videoFrameContainer">
+        <!-- Iframe injected dynamically -->
+      </div>
+      <div class="modal-body">
+        <h2 class="modal-body-title" id="modalVideoTitle">Episode Title</h2>
+        <p class="modal-body-desc" id="modalVideoDesc">Episode description</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- CREATE FOLDER MODAL (ADMIN ONLY) -->
+  <div class="modal-overlay" id="createFolderModal">
+    <div class="admin-form-modal">
+      <div class="modal-header" style="padding: 0 0 20px 0; border: none;">
+        <span class="modal-title" style="font-size: 18px;">Create New Folder / Playlist</span>
+        <button class="close-modal-btn" onclick="closeCreateFolderModal()">&times;</button>
+      </div>
+      <form id="createFolderForm" onsubmit="handleCreateFolder(event)">
+        <div class="form-group">
+          <label class="form-label">Folder Title *</label>
+          <input type="text" id="folderTitleInput" class="form-input" placeholder="e.g. Bigg Boss Season 1" required>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Thumbnail Image / Poster URL</label>
+          <input type="text" id="folderThumbInput" class="form-input" placeholder="e.g. https://drive.google.com/thumbnail?id=... or image URL">
+        </div>
+        <div class="form-group">
+          <label class="form-label">Description</label>
+          <input type="text" id="folderDescInput" class="form-input" placeholder="e.g. Full daily episodes and exclusive uncut clips">
+        </div>
+        <div style="display: flex; justify-content: flex-end; gap: 12px; margin-top: 24px;">
+          <button type="button" class="btn-ghost" onclick="closeCreateFolderModal()">Cancel</button>
+          <button type="submit" class="btn-solid">Create Folder</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- ADD VIDEO MODAL (ADMIN ONLY) -->
+  <div class="modal-overlay" id="addVideoModal">
+    <div class="admin-form-modal">
+      <div class="modal-header" style="padding: 0 0 20px 0; border: none;">
+        <span class="modal-title" style="font-size: 18px;" id="addVideoModalTitle">Add Video to Folder</span>
+        <button class="close-modal-btn" onclick="closeAddVideoModal()">&times;</button>
+      </div>
+      <form id="addVideoForm" onsubmit="handleAddVideo(event)">
+        <div class="form-group" id="nameModeGroup" style="display:none;">
+          <label class="form-label">Title format</label>
+          <select id="nameModeSelect" class="form-input" onchange="refreshNameForm()">
+            <option value="auto">Auto format</option>
+            <option value="custom">Custom name</option>
+          </select>
+        </div>
+        <div id="episodeFields" style="display:none;">
+          <div class="form-group" style="display:flex;gap:12px;">
+            <div style="flex:1;display:flex;flex-direction:column;gap:6px;min-width:0;">
+              <label class="form-label">Episode number *</label>
+              <input type="number" id="epNumInput" class="form-input" min="1" step="1" oninput="updateTitlePreview()">
+            </div>
+            <div style="flex:1;display:flex;flex-direction:column;gap:6px;min-width:0;">
+              <label class="form-label">Weekend tag</label>
+              <select id="epTagSelect" class="form-input" onchange="updateTitlePreview()">
+                <option value="auto">Auto (today)</option>
+                <option value="">None</option>
+                <option value="Saturday">WKW Saturday</option>
+                <option value="Sunday">WKW Sunday</option>
+              </select>
+            </div>
+          </div>
+        </div>
+        <div id="liveFeedFields" style="display:none;">
+          <div class="form-group">
+            <label class="form-label">Date *</label>
+            <input type="date" id="lfDateInput" class="form-input" oninput="updateTitlePreview()">
+          </div>
+          <div class="form-group" style="display:flex;gap:12px;">
+            <div style="flex:1;display:flex;flex-direction:column;gap:6px;min-width:0;">
+              <label class="form-label">Start time *</label>
+              <input type="time" id="lfStartInput" class="form-input" oninput="updateTitlePreview()">
+            </div>
+            <div style="flex:1;display:flex;flex-direction:column;gap:6px;min-width:0;">
+              <label class="form-label">End time *</label>
+              <input type="time" id="lfEndInput" class="form-input" oninput="updateTitlePreview()">
+            </div>
+          </div>
+        </div>
+        <div class="form-group" id="customTitleGroup">
+          <label class="form-label">Episode / Video Title *</label>
+          <input type="text" id="videoTitleInput" class="form-input" placeholder="e.g. Episode 1 — Grand Premiere" required>
+        </div>
+        <div id="titlePreview" style="display:none;margin:-4px 0 16px;font-size:13px;opacity:.85;"></div>
+        <div class="form-group" id="r2KeyGroup" style="display:none;">
+          <label class="form-label">File in the R2 bucket *</label>
+          <select id="r2KeyInput" class="form-input"></select>
+          <div id="r2KeyHint" style="font-size:12px;opacity:.7;margin-top:6px;">Upload the file to the bucket first, then pick it here.</div>
+        </div>
+        <div class="form-group" id="driveUrlGroup">
+          <label class="form-label">Google Drive Link or File ID *</label>
+          <input type="text" id="videoUrlInput" class="form-input" placeholder="e.g. https://drive.google.com/file/d/1A2B3C.../view" required>
+        </div>
+        <div class="form-group" id="descGroup">
+          <label class="form-label">Description (Optional)</label>
+          <input type="text" id="videoDescInput" class="form-input" placeholder="e.g. Day 1 unedited stream archive">
+        </div>
+        <div style="display: flex; justify-content: flex-end; gap: 12px; margin-top: 24px;">
+          <button type="button" class="btn-ghost" onclick="closeAddVideoModal()">Cancel</button>
+          <button type="submit" class="btn-solid" id="addVideoSubmitBtn">Add Video</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <footer>
+    <p>&copy; 2026 Streamflix Inc. All rights reserved. Ultra Low-Latency Stream & VOD Vault.</p>
+  </footer>
+
+  <script>
+    let isAdmin = false;
+    let activeFolder = null; // null = Root Folder view, object = Inside Folder view
+    let currentFolders = [];
+    let currentVideos = [];
+
+    function handleVideoThumbError(imgEl, videoUrl, driveId) {
+      const id = driveId || extractDriveId(videoUrl);
+      if (id) {
+        imgEl.src = `https://lh3.googleusercontent.com/d/${id}=w1000`;
+      } else {
+        imgEl.src = '/library/assets/poster1.png';
+      }
+    }
+
+    function extractDriveId(urlOrId) {
+      if (!urlOrId) return null;
+      const clean = urlOrId.trim();
+      const matchPath = clean.match(/\/file\/d\/([a-zA-Z0-9_-]+)/);
+      if (matchPath && matchPath[1]) return matchPath[1];
+      const matchQuery = clean.match(/id=([a-zA-Z0-9_-]+)/);
+      if (matchQuery && matchQuery[1]) return matchQuery[1];
+      const matchDriveId = clean.match(/drive\.google\.com.*[\/=]([a-zA-Z0-9_-]{25,})/);
+      if (matchDriveId && matchDriveId[1]) return matchDriveId[1];
+      if (/^[a-zA-Z0-9_-]{20,}$/.test(clean)) return clean;
+      return null;
+    }
+
+    function resolveImageUrl(urlOrId) {
+      if (!urlOrId || !urlOrId.trim()) return '/library/assets/poster1.png';
+      const clean = urlOrId.trim();
+      const driveId = extractDriveId(clean);
+      if (driveId) {
+        return `https://lh3.googleusercontent.com/d/${driveId}=w1000`;
+      }
+      return clean;
+    }
+
+    function escapeHtml(str) {
+      if (!str) return '';
+      return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#039;");
+    }
+
+    // Auth & Admin check
+    async function checkAuthStatus() {
+      const navAuthSection = document.getElementById('navAuthSection');
+      const token = localStorage.getItem('token');
+      const headers = {};
+      if (token) headers['Authorization'] = `Bearer ${token}`;
+
+      try {
+        const res = await fetch('/api/me', { headers, credentials: 'include' });
+        if (res.ok) {
+          const user = await res.json();
+          const username = user.username || (user.user && user.user.username);
+          isAdmin = !!user.isAdmin || user.role === 'admin';
+          
+          navAuthSection.innerHTML = `
+            <div class="user-badge">
+              <span class="user-name">Welcome, <strong>${escapeHtml(username)}</strong>${isAdmin ? ' <span style="color:var(--cyan);font-size:11px;font-weight:700;margin-left:4px;">[ADMIN]</span>' : ''}</span>
+              <button onclick="handleLogout()" class="btn-logout">Log Out</button>
+            </div>
+          `;
+        } else {
+          localStorage.removeItem('token');
+          isAdmin = false;
+        }
+      } catch (err) {
+        console.error('Auth check error:', err);
+        isAdmin = false;
+      }
+      renderHeaderActions();
+      loadRootFolders();
+    }
+
+    async function handleLogout() {
+      try {
+        const token = localStorage.getItem('token');
+        const headers = { 'Content-Type': 'application/json' };
+        if (token) headers['Authorization'] = `Bearer ${token}`;
+        await fetch('/api/logout', { method: 'POST', headers, credentials: 'include' });
+      } catch (err) {}
+      localStorage.clear();
+      sessionStorage.clear();
+      document.cookie.split(";").forEach((c) => {
+        document.cookie = c.replace(/^ +/, "").replace(/=.*/, "=;expires=" + new Date().toUTCString() + ";path=/");
+      });
+      window.location.href = '/';
+    }
+
+    // Render Admin Action Buttons
+    function renderHeaderActions() {
+      const container = document.getElementById('adminHeaderActions');
+      if (!isAdmin) {
+        container.innerHTML = '';
+        return;
+      }
+
+      if (!activeFolder) {
+        container.innerHTML = `
+          <button class="btn-admin-action" onclick="openCreateFolderModal()">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
+            + Create Folder
+          </button>
+        `;
+      } else {
+        container.innerHTML = `
+          <button class="btn-admin-action" onclick="openAddVideoModal()">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
+            + Add Episode / Video
+          </button>
+        `;
+      }
+    }
+
+    // Render Breadcrumb Navigation
+    function updateBreadcrumb() {
+      const breadcrumb = document.getElementById('breadcrumbNav');
+      if (!activeFolder) {
+        breadcrumb.innerHTML = `<span style="font-weight:700;color:var(--text);">Library Folders</span>`;
+        document.getElementById('pageHeading').innerHTML = `Show <span class="highlight">Folders</span>`;
+        document.getElementById('pageSubheading').innerText = `Browse show playlists and stream folders.`;
+      } else {
+        breadcrumb.innerHTML = `
+          <a href="javascript:void(0)" onclick="loadRootFolders()">Library Folders</a>
+          <span class="sep">/</span>
+          <span style="font-weight:700;color:var(--text);">${escapeHtml(activeFolder.title)}</span>
+        `;
+        document.getElementById('pageHeading').innerText = activeFolder.title;
+        document.getElementById('pageSubheading').innerText = activeFolder.description || "Watch episodes and recorded streams.";
+      }
+      renderHeaderActions();
+    }
+
+    // Fetch and render Root Folders
+    async function loadRootFolders() {
+      activeFolder = null;
+      updateBreadcrumb();
+      const grid = document.getElementById('mainGrid');
+
+      try {
+        const res = await fetch('/api/library/folders');
+        const data = await res.json();
+        currentFolders = data.folders || [];
+
+        if (currentFolders.length === 0) {
+          grid.innerHTML = `
+            <div class="empty-state">
+              <h3>No Folders Created Yet</h3>
+              <p>${isAdmin ? 'Click "+ Create Folder" above to add a new show playlist!' : 'Folders and playlists will appear here once created.'}</p>
+            </div>
+          `;
+          return;
+        }
+
+        grid.innerHTML = currentFolders.map(folder => {
+          const thumb = resolveImageUrl(folder.thumbnail_url);
+          return `
+            <div class="folder-card" onclick="openFolder(${folder.id})">
+              <div class="folder-thumb-wrap">
+                <img src="${escapeHtml(thumb)}" alt="${escapeHtml(folder.title)}" class="folder-thumb" onerror="this.src='/library/assets/poster1.png'" loading="lazy">
+                <span class="folder-count-badge">${folder.video_count || 0} Videos</span>
+              </div>
+              <div class="folder-body">
+                <h3 class="folder-title">${escapeHtml(folder.title)}</h3>
+                <p class="folder-desc">${escapeHtml(folder.description || 'Show playlist & recorded episodes.')}</p>
+                <div class="folder-footer">
+                  <span class="open-folder-link">
+                    Open Folder
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="9 18 15 12 9 6"></polyline></svg>
+                  </span>
+                  ${isAdmin ? `<button class="delete-item-btn" onclick="event.stopPropagation(); deleteFolder(${folder.id})">Delete</button>` : ''}
+                </div>
+              </div>
+            </div>
+          `;
+        }).join('');
+      } catch (err) {
+        console.error('Failed to load folders:', err);
+        grid.innerHTML = `<div class="empty-state"><h3>Error loading library folders</h3></div>`;
+      }
+    }
+
+    // Fetch and render videos inside a folder
+    async function openFolder(folderId) {
+      const grid = document.getElementById('mainGrid');
+      grid.innerHTML = `<div class="empty-state"><h3>Loading videos...</h3></div>`;
+
+      try {
+        const res = await fetch(`/api/library/folders/${folderId}/videos`);
+        if (!res.ok) {
+          loadRootFolders();
+          return;
+        }
+        const data = await res.json();
+        activeFolder = data.folder;
+        currentVideos = data.videos || [];
+        updateBreadcrumb();
+
+        if (currentVideos.length === 0) {
+          grid.innerHTML = `
+            <div class="empty-state">
+              <h3>No Videos in this Folder</h3>
+              <p>${isAdmin ? 'Click "+ Add Episode / Video" above to add videos!' : 'Episodes will be added soon.'}</p>
+            </div>
+          `;
+          return;
+        }
+
+        grid.innerHTML = currentVideos.map(video => {
+          // R2 videos carry a frame grabbed by the server; Drive videos use Google's.
+          const thumb = video.storage === 'r2' && video.thumbnail_url
+            ? video.thumbnail_url
+            : resolveImageUrl(video.video_url || video.drive_id);
+
+          return `
+            <div class="video-card" onclick="playVideo('${video.id}')">
+              <div class="video-thumb-wrap">
+                <img id="vthumb_${video.id}" src="${escapeHtml(thumb)}" alt="${escapeHtml(video.title)}" class="video-thumb" onerror="handleVideoThumbError(this, '${escapeHtml(video.video_url || '')}', '${escapeHtml(video.drive_id || '')}')" loading="lazy">
+                <div class="play-overlay">
+                  <div class="play-btn-circle">
+                    <svg viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg>
+                  </div>
+                </div>
+                ${video.storage === 'r2' ? `<span class="folder-count-badge">${APPLE_PLAYBACK ? 'Download · ' + fmtGB(video.size_bytes) : r2BadgeText(video)}</span>` : ''}
+              </div>
+              <div class="video-body">
+                <h3 class="video-title">${escapeHtml(video.title)}</h3>
+                <p class="video-desc">${escapeHtml(video.description || 'Recorded episode broadcast.')}</p>
+                <div class="video-footer">
+                  <button class="btn-play-action" onclick="event.stopPropagation(); playVideo('${video.id}')">
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg>
+                    ${video.storage === 'r2' && (video.watchesLeft === 0 || APPLE_PLAYBACK) ? 'Download' : 'Watch Episode'}
+                  </button>
+                  ${isAdmin ? `<button class="delete-item-btn" onclick="event.stopPropagation(); openRenameModal(${video.id})">Rename</button><button class="delete-item-btn" onclick="event.stopPropagation(); deleteVideo(${video.id})">Delete</button>` : ''}
+                </div>
+              </div>
+            </div>
+          `;
+        }).join('');
+      } catch (err) {
+        console.error('Failed to load folder videos:', err);
+        loadRootFolders();
+      }
+    }
+
+    // Play Video Modal
+    let currentModalVideo = null;
+
+    function renderModalPlayer() {
+      if (!currentModalVideo) return;
+      const driveId = currentModalVideo.drive_id || extractDriveId(currentModalVideo.video_url);
+      const frameContainer = document.getElementById('videoFrameContainer');
+      setFramePlayer();
+
+      if (driveId) {
+        frameContainer.innerHTML = `<iframe src="https://drive.google.com/file/d/${driveId}/preview" allow="autoplay; fullscreen" allowfullscreen style="width:100%;height:100%;border:none;"></iframe>`;
+      } else {
+        frameContainer.innerHTML = `<video src="${escapeHtml(currentModalVideo.video_url)}" controls autoplay style="width:100%;height:100%;object-fit:contain;background:#000;"></video>`;
+      }
+    }
+
+    function togglePlayerMode(mode) {
+      playerMode = mode;
+      document.querySelectorAll('.mode-btn').forEach(b => b.classList.remove('active'));
+      const activeBtn = document.getElementById(`modeBtn_${mode}`);
+      if (activeBtn) activeBtn.classList.add('active');
+      renderModalPlayer();
+    }
+
+    function playVideo(id) {
+      currentModalVideo = currentVideos.find(v => String(v.id) === String(id));
+      if (!currentModalVideo) return;
+
+      document.getElementById('modalHeaderTitle').innerText = currentModalVideo.title;
+      document.getElementById('modalVideoTitle').innerText = currentModalVideo.title;
+      document.getElementById('modalVideoDesc').innerText = currentModalVideo.description || "Video playback.";
+
+      document.getElementById('videoModal').style.display = 'flex';
+      if (currentModalVideo.storage === 'r2') {
+        if (APPLE_PLAYBACK) { r2ShowDownloadOnly(currentModalVideo, { apple: true }); return; }
+        startR2Watch(currentModalVideo); return;
+      }
+      renderModalPlayer();
+    }
+
+    // ===== Apple devices: download-only for R2 videos =====
+    // Same rule as the server (isApplePlayback in server.js): every browser on
+    // iPhone/iPad, and Safari on Mac. Apple's media engine can't start the long
+    // single-file MP4s, so those devices download instead (no watches used).
+    const APPLE_PLAYBACK = (() => {
+      const ua = navigator.userAgent || '';
+      if (/iPhone|iPad|iPod/.test(ua)) return true;
+      return /Macintosh/.test(ua) && /Safari/.test(ua) && !/Chrome|Chromium|CriOS|FxiOS|Firefox|Edg|OPR/.test(ua);
+    })();
+
+    function fmtGB(bytes) {
+      if (!bytes) return '';
+      return bytes >= 1e9 ? (bytes / 1e9).toFixed(1) + ' GB' : Math.max(1, Math.round(bytes / 1e6)) + ' MB';
+    }
+
+    // ===== Title formats =====
+    //   episode:  "Episode 27"  /  "Episode 27 (WKW Saturday)"
+    //   livefeed: "Live Feed 1stOct2026 10:00 - 01:00(next day)"
+    const TITLE_MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sept', 'Oct', 'Nov', 'Dec'];
+
+    function ordinal(n) {
+      const v = n % 100;
+      if (v >= 11 && v <= 13) return n + 'th';
+      return n + ({ 1: 'st', 2: 'nd', 3: 'rd' }[n % 10] || 'th');
+    }
+
+    // Today's date in IST as YYYY-MM-DD, and its weekday (0 = Sunday).
+    function istToday() {
+      const d = new Date(Date.now() + 5.5 * 3600 * 1000);
+      return { iso: d.toISOString().slice(0, 10), weekday: d.getUTCDay() };
+    }
+
+    function episodeTitle(n, tag) {
+      return `Episode ${n}` + (tag ? ` (WKW ${tag})` : '');
+    }
+
+    function liveFeedTitle(isoDate, start, end) {
+      const [y, m, d] = isoDate.split('-').map(Number);
+      return `Live Feed ${ordinal(d)}${TITLE_MONTHS[m - 1]}${y} ${start} - ${end}` + (end <= start ? '(next day)' : '');
+    }
+
+    // Highest "Episode <n>" in the open folder (tolerates "Episode - 2",
+    // "Episode 8(WKV Sunday)" ...), so the counter continues from there.
+    function nextEpisodeNumber() {
+      let max = 0;
+      for (const v of currentVideos) {
+        const m = String(v.title || '').match(/episode\s*-?\s*(\d+)/i);
+        if (m) max = Math.max(max, Number(m[1]));
+      }
+      return max + 1;
+    }
+
+    let renamingVideo = null; // null = adding a new video
+
+    function folderNaming() { return (activeFolder && activeFolder.naming) || null; }
+
+    function refreshNameForm() {
+      const naming = folderNaming();
+      const auto = !!naming && document.getElementById('nameModeSelect').value === 'auto';
+      document.getElementById('nameModeGroup').style.display = naming ? '' : 'none';
+      document.getElementById('episodeFields').style.display = auto && naming === 'episode' ? '' : 'none';
+      document.getElementById('liveFeedFields').style.display = auto && naming === 'livefeed' ? '' : 'none';
+      document.getElementById('customTitleGroup').style.display = auto ? 'none' : '';
+      document.getElementById('videoTitleInput').required = !auto;
+      document.getElementById('epNumInput').required = auto && naming === 'episode';
+      ['lfDateInput', 'lfStartInput', 'lfEndInput'].forEach(id => { document.getElementById(id).required = auto && naming === 'livefeed'; });
+      updateTitlePreview();
+    }
+
+    function computedTitle() {
+      const naming = folderNaming();
+      if (!naming || document.getElementById('nameModeSelect').value !== 'auto') {
+        return document.getElementById('videoTitleInput').value.trim();
+      }
+      if (naming === 'episode') {
+        const n = parseInt(document.getElementById('epNumInput').value, 10);
+        if (!n || n < 1) return '';
+        let tag = document.getElementById('epTagSelect').value;
+        if (tag === 'auto') { const wd = istToday().weekday; tag = wd === 6 ? 'Saturday' : wd === 0 ? 'Sunday' : ''; }
+        return episodeTitle(n, tag);
+      }
+      const date = document.getElementById('lfDateInput').value;
+      const start = document.getElementById('lfStartInput').value;
+      const end = document.getElementById('lfEndInput').value;
+      if (!date || !start || !end) return '';
+      return liveFeedTitle(date, start, end);
+    }
+
+    function updateTitlePreview() {
+      const box = document.getElementById('titlePreview');
+      const auto = !!folderNaming() && document.getElementById('nameModeSelect').value === 'auto';
+      box.style.display = auto ? '' : 'none';
+      const t = computedTitle();
+      box.textContent = t ? `Title: ${t}` : 'Title: fill in the fields above';
+    }
+
+    // Puts the naming fields in their starting state - for a new video the
+    // next episode number / today's date; for a rename, parsed from the
+    // current title where it already follows the format.
+    function setupNameForm(video) {
+      const naming = folderNaming();
+      const title = video ? String(video.title || '') : '';
+      document.getElementById('videoTitleInput').value = title;
+      document.getElementById('epTagSelect').value = 'auto';
+      document.getElementById('lfDateInput').value = istToday().iso;
+      document.getElementById('lfStartInput').value = '';
+      document.getElementById('lfEndInput').value = '';
+      let auto = !!naming;
+      if (naming === 'episode') {
+        const m = title.match(/episode\s*-?\s*(\d+)/i);
+        document.getElementById('epNumInput').value = video ? (m ? m[1] : '') : nextEpisodeNumber();
+        if (video) {
+          const tm = title.match(/(saturday|sunday)/i);
+          document.getElementById('epTagSelect').value = tm ? (tm[1][0].toUpperCase() + tm[1].slice(1).toLowerCase()) : '';
+          if (!m) auto = false;
+        }
+      } else if (naming === 'livefeed' && video) {
+        const dm = title.match(/(\d{1,2})(?:st|nd|rd|th)\s*(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sept?|Oct|Nov|Dec)\w*\s*(\d{4})/i);
+        const tm = title.match(/(\d{2}:\d{2})\D{1,4}(\d{2}:\d{2})/);
+        if (dm) {
+          const mi = TITLE_MONTHS.findIndex(x => x.slice(0, 3).toLowerCase() === dm[2].slice(0, 3).toLowerCase());
+          document.getElementById('lfDateInput').value = `${dm[3]}-${String(mi + 1).padStart(2, '0')}-${String(dm[1]).padStart(2, '0')}`;
+        }
+        if (tm) { document.getElementById('lfStartInput').value = tm[1]; document.getElementById('lfEndInput').value = tm[2]; }
+        if (!dm || !tm) auto = false;
+      }
+      document.getElementById('nameModeSelect').value = auto ? 'auto' : 'custom';
+      refreshNameForm();
+    }
+
+    function openRenameModal(videoId) {
+      const video = currentVideos.find(v => String(v.id) === String(videoId));
+      if (!video) return;
+      renamingVideo = video;
+      document.getElementById('addVideoModalTitle').textContent = 'Rename Video';
+      document.getElementById('addVideoSubmitBtn').textContent = 'Save Name';
+      document.getElementById('driveUrlGroup').style.display = 'none';
+      document.getElementById('r2KeyGroup').style.display = 'none';
+      document.getElementById('descGroup').style.display = 'none';
+      document.getElementById('videoUrlInput').required = false;
+      document.getElementById('r2KeyInput').required = false;
+      setupNameForm(video);
+      document.getElementById('addVideoModal').style.display = 'flex';
+    }
+
+    // ===== R2 videos: two watches, then download-only =====
+    // A "watch" lasts while this player stays open. The server hands out a
+    // 2-minute pass that this page renews every 45s; closing the player stops
+    // the renewals, so the watch ends. Reopening within 2 minutes continues
+    // the same watch (so a refresh or a phone lock doesn't burn one).
+    let r2Session = null; // { id, timer, video }
+
+    function r2BadgeText(v) {
+      if (v.watchesLeft === 0) return 'Download only';
+      if (v.watchesLeft === 1) return '1 watch left';
+      return `${v.watchesLeft} watches left`;
+    }
+
+    function r2Api(videoId, action) {
+      return fetch(`/api/library/r2/${videoId}/${action}`, { method: 'POST', credentials: 'include' })
+        .then(async (res) => {
+          let body = null;
+          try { body = await res.json(); } catch (e) {}
+          return { status: res.status, body };
+        });
+    }
+
+    // Message screens (download-only, sign-in, errors) grow to fit their text -
+    // on a phone the 16:9 video box is too short for them. setFramePlayer()
+    // puts the box back to 16:9 before a player is rendered.
+    function r2Message(html) {
+      const frame = document.getElementById('videoFrameContainer');
+      frame.style.aspectRatio = 'auto';
+      frame.style.minHeight = '260px';
+      frame.innerHTML =
+        `<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;padding:32px 24px;min-height:260px;box-sizing:border-box;text-align:center;color:#e8e8ec;font-size:15px;line-height:1.5;">${html}</div>`;
+    }
+
+    function setFramePlayer() {
+      const frame = document.getElementById('videoFrameContainer');
+      frame.style.aspectRatio = '';
+      frame.style.minHeight = '';
+    }
+
+    function r2SetNote(text) {
+      let note = document.getElementById('r2WatchNote');
+      if (!note) {
+        note = document.createElement('p');
+        note.id = 'r2WatchNote';
+        note.className = 'modal-body-desc';
+        note.style.cssText = 'margin-top:10px;font-size:13px;opacity:.8;';
+        document.getElementById('modalVideoDesc').after(note);
+      }
+      note.textContent = text;
+    }
+
+    function r2ShowDownloadOnly(video, opts = {}) {
+      const sizeNote = video.size_bytes
+        ? `This video is ${fmtGB(video.size_bytes)} — make sure you have that much free space. On mobile data it can take hours, and an interrupted download starts over.`
+        : '';
+      const head = opts.apple
+        ? `<div style="font-size:18px;font-weight:600;">Download to watch on this device</div>
+           <div style="max-width:440px;opacity:.8;">Playback of this video isn't available on iPhone, iPad or Safari. Download it and watch it from your device.</div>`
+        : `<div style="font-size:18px;font-weight:600;">You've watched this episode twice</div>
+           <div style="max-width:440px;opacity:.8;">Both watches are used, so this episode is now download-only.</div>`;
+      r2Message(`
+        ${head}
+        ${sizeNote ? `<div style="max-width:440px;font-size:13px;opacity:.65;">${sizeNote}</div>` : ''}
+        <button class="btn-solid" id="r2DownloadBtn" style="padding:12px 26px;">Download episode</button>
+        <div id="r2DownloadMsg" style="font-size:13px;opacity:.75;"></div>`);
+      r2SetNote('Download only');
+      document.getElementById('r2DownloadBtn').onclick = async () => {
+        const msg = document.getElementById('r2DownloadMsg');
+        msg.textContent = 'Preparing your download…';
+        const r = await r2Api(video.id, 'download');
+        if (r.status === 200 && r.body && r.body.url) {
+          const a = document.createElement('a');
+          a.href = r.body.url; a.rel = 'noopener';
+          document.body.appendChild(a); a.click(); a.remove();
+          msg.textContent = 'Your download has started. The link works for 10 minutes — tap the button again for a new one.';
+        } else if (r.status === 403 && !r.body) {
+          msg.textContent = "Today's access link has changed — open the current link to continue.";
+        } else {
+          msg.textContent = (r.body && r.body.error) || 'Could not start the download. Please try again.';
+        }
+      };
+    }
+
+    async function startR2Watch(video) {
+      r2StopTimer();
+      r2Message('<div style="opacity:.8;">Starting…</div>');
+      const r = await r2Api(video.id, 'watch');
+      if (!currentModalVideo || currentModalVideo.id !== video.id) return; // closed while waiting
+      if (r.status === 401) {
+        r2Message(`<div>Please sign in to watch.</div><a class="btn-solid" style="padding:12px 26px;text-decoration:none;" href="/login.html?redirect=/library/">Sign in</a>`);
+        return;
+      }
+      if (r.status === 403 && r.body && r.body.downloadOnly) { video.watchesLeft = 0; r2ShowDownloadOnly(video); return; }
+      if (r.status === 403) {
+        r2Message(`<div style="font-size:18px;font-weight:600;">Today's access link has changed</div><div style="max-width:420px;opacity:.8;">Open the current access link, then come back to this page.</div>`);
+        return;
+      }
+      if (r.status !== 200 || !r.body || !r.body.src) {
+        r2Message('<div>Could not start playback. Please try again.</div>');
+        return;
+      }
+      r2ApplyCounts(video, r.body);
+      setFramePlayer();
+      const frame = document.getElementById('videoFrameContainer');
+      frame.innerHTML = `<video src="${escapeHtml(r.body.src)}" controls autoplay playsinline controlsList="nodownload" disablePictureInPicture style="width:100%;height:100%;object-fit:contain;background:#000;"></video>`;
+      frame.querySelector('video').addEventListener('contextmenu', (e) => e.preventDefault());
+      r2Session = { id: video.id, video, timer: setInterval(() => r2Heartbeat(video), r.body.heartbeatMs || 45000) };
+    }
+
+    function r2ApplyCounts(video, body) {
+      if (typeof body.watchesUsed === 'number' && body.watchesLeft !== null) {
+        video.watchesUsed = body.watchesUsed; video.watchesLeft = body.watchesLeft;
+        r2SetNote(`Watch ${body.watchesUsed} of ${body.watchLimit}. Closing the player ends this watch — reopening within 2 minutes continues it.`);
+      } else {
+        r2SetNote('Admin view — watches are not counted.');
+      }
+    }
+
+    async function r2Heartbeat(video) {
+      const r = await r2Api(video.id, 'heartbeat');
+      if (!r2Session || r2Session.id !== video.id) return;
+      if (r.status === 200) return;
+      if (r.status === 410) { // away longer than the window: this is a new watch (or download-only)
+        const el = document.querySelector('#videoFrameContainer video');
+        const t = el ? el.currentTime : 0;
+        const again = await r2Api(video.id, 'watch');
+        if (!r2Session || r2Session.id !== video.id) return;
+        if (again.status === 200) { r2ApplyCounts(video, again.body); if (el && t) el.currentTime = t; return; }
+        if (again.status === 403 && again.body && again.body.downloadOnly) { r2StopTimer(); video.watchesLeft = 0; r2ShowDownloadOnly(video); return; }
+      }
+      r2StopTimer();
+      const el = document.querySelector('#videoFrameContainer video'); if (el) el.pause();
+      if (r.status === 401) r2Message('<div>Your session has ended. Please sign in again.</div>');
+      else r2Message(`<div style="font-size:18px;font-weight:600;">Today's access link has changed</div><div style="max-width:420px;opacity:.8;">Open the current access link, then reopen the episode.</div>`);
+    }
+
+    function r2StopTimer() { if (r2Session && r2Session.timer) clearInterval(r2Session.timer); if (r2Session) r2Session.timer = null; }
+
+    // Tell the server the player is closed (best effort; the 2-minute pass
+    // expiry ends the watch anyway if this never arrives).
+    function r2EndSession() {
+      if (!r2Session) return;
+      r2StopTimer();
+      const id = r2Session.id;
+      r2Session = null;
+      const note = document.getElementById('r2WatchNote'); if (note) note.remove();
+      try { fetch(`/api/library/r2/${id}/close`, { method: 'POST', credentials: 'include', keepalive: true }); } catch (e) {}
+    }
+    window.addEventListener('pagehide', () => {
+      if (r2Session && navigator.sendBeacon) navigator.sendBeacon(`/api/library/r2/${r2Session.id}/close`);
+    });
+
+    function closeVideoModal() {
+      const wasR2 = currentModalVideo && currentModalVideo.storage === 'r2';
+      if (wasR2) {
+        const vEl = document.querySelector('#videoFrameContainer video');
+        if (vEl) { vEl.pause(); vEl.removeAttribute('src'); vEl.load(); }
+        r2EndSession();
+        const note = document.getElementById('r2WatchNote'); if (note) note.remove();
+        if (activeFolder) openFolder(activeFolder.id); // refresh the "watches left" badges
+      }
+      currentModalVideo = null;
+      const frameContainer = document.getElementById('videoFrameContainer');
+      const videoEl = frameContainer.querySelector('video');
+      if (videoEl) videoEl.pause();
+      frameContainer.innerHTML = '';
+      setFramePlayer();
+      document.getElementById('videoModal').style.display = 'none';
+    }
+
+    // Admin: Create Folder
+    function openCreateFolderModal() {
+      document.getElementById('createFolderModal').style.display = 'flex';
+    }
+
+    function closeCreateFolderModal() {
+      document.getElementById('createFolderForm').reset();
+      document.getElementById('createFolderModal').style.display = 'none';
+    }
+
+    async function handleCreateFolder(e) {
+      e.preventDefault();
+      const title = document.getElementById('folderTitleInput').value.trim();
+      const thumbnail_url = document.getElementById('folderThumbInput').value.trim();
+      const description = document.getElementById('folderDescInput').value.trim();
+
+      const token = localStorage.getItem('token');
+      const headers = { 'Content-Type': 'application/json' };
+      if (token) headers['Authorization'] = `Bearer ${token}`;
+
+      try {
+        const res = await fetch('/api/library/folders', {
+          method: 'POST',
+          headers,
+          credentials: 'include',
+          body: JSON.stringify({ title, description, thumbnail_url })
+        });
+        const data = await res.json();
+        if (res.ok) {
+          closeCreateFolderModal();
+          loadRootFolders();
+        } else {
+          alert(data.error || 'Failed to create folder');
+        }
+      } catch (err) {
+        alert('Server error creating folder');
+      }
+    }
+
+    // Admin: Delete Folder
+    async function deleteFolder(folderId) {
+      if (!confirm('Are you sure you want to delete this folder and all its videos?')) return;
+      const token = localStorage.getItem('token');
+      const headers = {};
+      if (token) headers['Authorization'] = `Bearer ${token}`;
+
+      try {
+        const res = await fetch(`/api/library/folders/${folderId}`, {
+          method: 'DELETE',
+          headers,
+          credentials: 'include'
+        });
+        if (res.ok) {
+          loadRootFolders();
+        } else {
+          const data = await res.json();
+          alert(data.error || 'Failed to delete folder');
+        }
+      } catch (err) {
+        alert('Server error deleting folder');
+      }
+    }
+
+    // Admin: Add Video
+    async function openAddVideoModal() {
+      renamingVideo = null;
+      document.getElementById('addVideoModalTitle').textContent = 'Add Video to Folder';
+      document.getElementById('addVideoSubmitBtn').textContent = 'Add Video';
+      document.getElementById('descGroup').style.display = '';
+      setupNameForm(null);
+      const isR2 = !!(activeFolder && activeFolder.storage === 'r2');
+      document.getElementById('driveUrlGroup').style.display = isR2 ? 'none' : '';
+      document.getElementById('r2KeyGroup').style.display = isR2 ? '' : 'none';
+      document.getElementById('videoUrlInput').required = !isR2;
+      document.getElementById('r2KeyInput').required = isR2;
+      document.getElementById('addVideoModal').style.display = 'flex';
+      if (!isR2) return;
+      const sel = document.getElementById('r2KeyInput');
+      sel.innerHTML = '<option value="">Loading bucket…</option>';
+      try {
+        const res = await fetch('/api/library/r2/objects', { credentials: 'include' });
+        const data = await res.json();
+        const objs = data.objects || [];
+        sel.innerHTML = objs.length
+          ? '<option value="">Choose a file…</option>' + objs.map(o => `<option value="${escapeHtml(o.key)}" ${o.used ? 'disabled' : ''}>${escapeHtml(o.key)} — ${(o.size / 1073741824).toFixed(2)} GB${o.used ? ' (already added)' : ''}</option>`).join('')
+          : '<option value="">No video files in the bucket yet</option>';
+      } catch (e) {
+        sel.innerHTML = '<option value="">Could not read the bucket</option>';
+      }
+    }
+
+    function closeAddVideoModal() {
+      renamingVideo = null;
+      document.getElementById('addVideoForm').reset();
+      document.getElementById('addVideoModal').style.display = 'none';
+    }
+
+    async function handleAddVideo(e) {
+      e.preventDefault();
+      if (!activeFolder) return;
+
+      const title = computedTitle();
+      if (!title) { alert('Please fill in the title fields.'); return; }
+      if (renamingVideo) { await submitRename(title); return; }
+      const video_url = document.getElementById('videoUrlInput').value.trim();
+      const r2_key = document.getElementById('r2KeyInput').value;
+      const description = document.getElementById('videoDescInput').value.trim();
+
+      const token = localStorage.getItem('token');
+      const headers = { 'Content-Type': 'application/json' };
+      if (token) headers['Authorization'] = `Bearer ${token}`;
+
+      try {
+        const res = await fetch('/api/library/videos', {
+          method: 'POST',
+          headers,
+          credentials: 'include',
+          body: JSON.stringify({ folder_id: activeFolder.id, title, video_url, description, r2_key })
+        });
+        const data = await res.json();
+        if (res.ok) {
+          closeAddVideoModal();
+          openFolder(activeFolder.id);
+        } else {
+          alert(data.error || 'Failed to add video');
+        }
+      } catch (err) {
+        alert('Server error adding video');
+      }
+    }
+
+    async function submitRename(title) {
+      const id = renamingVideo.id;
+      try {
+        const res = await fetch(`/api/library/videos/${id}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'include',
+          body: JSON.stringify({ title })
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) { alert(data.error || 'Failed to rename video'); return; }
+        closeAddVideoModal();
+        openFolder(activeFolder.id);
+      } catch (err) {
+        alert('Server error renaming video');
+      }
+    }
+
+    // Admin: Delete Video
+    async function deleteVideo(videoId) {
+      if (!confirm('Are you sure you want to delete this video?')) return;
+      const token = localStorage.getItem('token');
+      const headers = {};
+      if (token) headers['Authorization'] = `Bearer ${token}`;
+
+      try {
+        const res = await fetch(`/api/library/videos/${videoId}`, {
+          method: 'DELETE',
+          headers,
+          credentials: 'include'
+        });
+        if (res.ok && activeFolder) {
+          openFolder(activeFolder.id);
+        } else {
+          const data = await res.json();
+          alert(data.error || 'Failed to delete video');
+        }
+      } catch (err) {
+        alert('Server error deleting video');
+      }
+    }
+
+    // Close Modals on overlay click or Escape key
+    document.getElementById('videoModal').addEventListener('click', e => { if (e.target.id === 'videoModal') closeVideoModal(); });
+    document.getElementById('createFolderModal').addEventListener('click', e => { if (e.target.id === 'createFolderModal') closeCreateFolderModal(); });
+    document.getElementById('addVideoModal').addEventListener('click', e => { if (e.target.id === 'addVideoModal') closeAddVideoModal(); });
+
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') {
+        if (document.getElementById('videoModal').style.display === 'flex') closeVideoModal();
+        if (document.getElementById('createFolderModal').style.display === 'flex') closeCreateFolderModal();
+        if (document.getElementById('addVideoModal').style.display === 'flex') closeAddVideoModal();
+      }
+    });
+
+    // Initialize
+    document.addEventListener('DOMContentLoaded', () => {
+      checkAuthStatus();
+    });
+  </script>
+</body>
+</html>

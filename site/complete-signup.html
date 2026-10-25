@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Finish Signing In — Streamflix</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --stage:#080A10; --stage-2:#0D111A;
+    --glass:rgba(255,255,255,0.045); --glass-border:rgba(255,255,255,0.09);
+    --blue:#3E7BFA; --gold:#D8AE44; --text:#EDEFF4; --text-dim:#7C8291; --error:#E24C5C;
+  }
+  *{margin:0;padding:0;box-sizing:border-box;}
+  body{background:var(--stage); color:var(--text); font-family:'Inter',sans-serif; min-height:100vh; display:flex; align-items:center; justify-content:center; padding:20px;}
+  a{text-decoration:none; color:inherit;}
+
+  .bg-field{ position:fixed; inset:0; z-index:0;
+    background:
+      radial-gradient(ellipse 900px 600px at 50% -10%, rgba(62,123,250,0.16), transparent 60%),
+      linear-gradient(var(--stage), var(--stage-2));
+  }
+
+  .auth-card{
+    position:relative; z-index:2; width:100%; max-width:400px;
+    background:var(--glass); border:1px solid var(--glass-border); border-radius:20px;
+    padding:40px 32px; backdrop-filter:blur(20px); -webkit-backdrop-filter:blur(20px);
+    box-shadow:0 20px 50px rgba(0,0,0,0.5);
+  }
+  .logo{ display:block; text-align:center; font-family:'Space Grotesk',sans-serif; font-weight:600; font-size:24px; margin-bottom:8px;}
+  .logo-x{ font-weight:700; font-style:italic; background:linear-gradient(135deg, var(--blue), var(--gold)); -webkit-background-clip:text; background-clip:text; color:transparent; font-size:28px;}
+
+  .welcome{ text-align:center; color:var(--text-dim); font-size:13.5px; margin-bottom:28px; }
+  .welcome strong{ color:var(--text); }
+
+  .avatar-row{ display:flex; align-items:center; gap:12px; margin-bottom:20px; padding:12px; background:rgba(0,0,0,0.2); border:1px solid var(--glass-border); border-radius:12px; }
+  .avatar-preview{ width:48px; height:48px; border-radius:12px; object-fit:cover; flex-shrink:0; background:#25252b; }
+  .avatar-choice{ display:flex; align-items:flex-start; gap:8px; font-size:13px; color:var(--text-dim); }
+  .avatar-choice input{ width:auto; margin-top:2px; accent-color:var(--blue); }
+
+  .form-group{ margin-bottom:20px; }
+  label{ display:block; font-size:12.5px; color:var(--text-dim); margin-bottom:8px; font-weight:500; }
+  input[type="text"]{
+    width:100%; padding:12px 16px; background:rgba(0,0,0,0.25); border:1px solid var(--glass-border);
+    border-radius:10px; color:var(--text); font-size:14px; outline:none; transition:border-color .2s;
+  }
+  input[type="text"]:focus{ border-color:var(--blue); }
+
+  .btn-submit{
+    width:100%; padding:13px; border:none; border-radius:10px; font-size:14px; font-weight:600;
+    color:#080A10; background:linear-gradient(135deg, var(--blue), #6FA0FF); cursor:pointer;
+    transition:filter .2s;
+  }
+  .btn-submit:hover{ filter:brightness(1.1); }
+  .btn-submit:disabled{ opacity:0.6; cursor:not-allowed; }
+
+  .error-msg{ color:var(--error); font-size:13px; margin-bottom:16px; text-align:center; display:none; }
+  .loading-msg{ text-align:center; color:var(--text-dim); font-size:13.5px; padding:20px 0; }
+</style>
+</head>
+<body>
+
+<div class="bg-field"></div>
+
+<div class="auth-card">
+  <a href="/" class="logo">Streamflix<span class="logo-x">X</span></a>
+
+  <div id="loadingState" class="loading-msg">Loading your Google details…</div>
+
+  <div id="formState" style="display:none;">
+    <div class="welcome">Welcome, <strong id="welcomeName"></strong> — just need a couple of things.</div>
+
+    <div id="errorBox" class="error-msg"></div>
+
+    <div id="avatarRow" class="avatar-row" style="display:none;">
+      <img id="avatarPreview" class="avatar-preview" alt="">
+      <label class="avatar-choice">
+        <input type="checkbox" id="useAvatar" checked>
+        Use this as my profile picture in chat
+      </label>
+    </div>
+
+    <form id="completeForm">
+      <div class="form-group">
+        <label for="username">Choose a username</label>
+        <input type="text" id="username" required minlength="3" maxlength="20" pattern="[A-Za-z0-9_]{3,20}" title="3-20 letters, numbers or underscore" autocomplete="username" />
+      </div>
+
+      <button type="submit" class="btn-submit" id="submitBtn">Finish Signing In</button>
+    </form>
+  </div>
+
+  <div id="expiredState" style="display:none;">
+    <div class="error-msg" style="display:block;">Your sign-in session expired. Please try again.</div>
+    <a href="/login.html" class="btn-submit" style="display:block; text-align:center; text-decoration:none;">Back to Log In</a>
+  </div>
+</div>
+
+<script>
+async function loadPending() {
+  try {
+    const res = await fetch('/api/auth/google/pending', { credentials: 'include' });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'expired');
+
+    document.getElementById('loadingState').style.display = 'none';
+    document.getElementById('formState').style.display = 'block';
+    document.getElementById('welcomeName').textContent = data.name || 'there';
+    document.getElementById('username').value = data.suggestedUsername || '';
+
+    if (data.pfpUrl) {
+      document.getElementById('avatarRow').style.display = 'flex';
+      document.getElementById('avatarPreview').src = data.pfpUrl;
+    }
+  } catch (err) {
+    document.getElementById('loadingState').style.display = 'none';
+    document.getElementById('expiredState').style.display = 'block';
+  }
+}
+
+document.getElementById('completeForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const errorBox = document.getElementById('errorBox');
+  const submitBtn = document.getElementById('submitBtn');
+  errorBox.style.display = 'none';
+
+  const username = document.getElementById('username').value.trim();
+  const avatarRow = document.getElementById('avatarRow');
+  const useAvatar = avatarRow.style.display !== 'none' && document.getElementById('useAvatar').checked;
+
+  if (!username) {
+    errorBox.textContent = 'Username is required.';
+    errorBox.style.display = 'block';
+    return;
+  }
+
+  submitBtn.disabled = true;
+  submitBtn.textContent = 'Finishing…';
+
+  try {
+    const res = await fetch('/api/auth/google/complete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ username, useAvatar })
+    });
+    const data = await res.json();
+
+    if (res.ok) {
+      window.location.href = data.redirect || '/live';
+    } else {
+      errorBox.textContent = data.error || 'Something went wrong. Please try again.';
+      errorBox.style.display = 'block';
+      submitBtn.disabled = false;
+      submitBtn.textContent = 'Finish Signing In';
+    }
+  } catch (err) {
+    errorBox.textContent = 'Unable to connect to the server.';
+    errorBox.style.display = 'block';
+    submitBtn.disabled = false;
+    submitBtn.textContent = 'Finish Signing In';
+  }
+});
+
+loadPending();
+</script>
+
+</body>
+</html>

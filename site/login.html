@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Log In — Streamflix</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --stage:#080A10; --stage-2:#0D111A;
+    --glass:rgba(255,255,255,0.045); --glass-border:rgba(255,255,255,0.09);
+    --blue:#3E7BFA; --gold:#D8AE44; --text:#EDEFF4; --text-dim:#7C8291; --error:#E24C5C;
+  }
+  *{margin:0;padding:0;box-sizing:border-box;}
+  body{background:var(--stage); color:var(--text); font-family:'Inter',sans-serif; min-height:100vh; display:flex; align-items:center; justify-content:center; padding:20px;}
+  a{text-decoration:none; color:inherit;}
+
+  .bg-field{ position:fixed; inset:0; z-index:0;
+    background:
+      radial-gradient(ellipse 900px 600px at 50% -10%, rgba(62,123,250,0.16), transparent 60%),
+      linear-gradient(var(--stage), var(--stage-2));
+  }
+
+  .auth-card{
+    position:relative; z-index:2; width:100%; max-width:400px;
+    background:var(--glass); border:1px solid var(--glass-border); border-radius:20px;
+    padding:40px 32px; backdrop-filter:blur(20px); -webkit-backdrop-filter:blur(20px);
+    box-shadow:0 20px 50px rgba(0,0,0,0.5);
+  }
+  .logo{ display:block; text-align:center; font-family:'Space Grotesk',sans-serif; font-weight:600; font-size:24px; margin-bottom:28px;}
+  .logo-x{ font-weight:700; font-style:italic; background:linear-gradient(135deg, var(--blue), var(--gold)); -webkit-background-clip:text; background-clip:text; color:transparent; font-size:28px;}
+
+  .form-group{ margin-bottom:20px; }
+  label{ display:block; font-size:12.5px; color:var(--text-dim); margin-bottom:8px; font-weight:500; }
+  input{
+    width:100%; padding:12px 16px; background:rgba(0,0,0,0.25); border:1px solid var(--glass-border);
+    border-radius:10px; color:var(--text); font-size:14px; outline:none; transition:border-color .2s;
+  }
+  input:focus{ border-color:var(--blue); }
+
+  .btn-submit{
+    width:100%; padding:13px; border:none; border-radius:10px; font-size:14px; font-weight:600;
+    color:#080A10; background:linear-gradient(135deg, var(--blue), #6FA0FF); cursor:pointer;
+    transition:filter .2s; margin-top:8px;
+  }
+  .btn-submit:hover{ filter:brightness(1.1); }
+
+  /* Deliberately NOT the site's blue gradient used by .btn-submit above -
+     this reads as a separate sign-in provider, not a second primary CTA. */
+  .auth-divider{ display:flex; align-items:center; gap:12px; margin:20px 0; color:var(--text-dim); font-size:12px; }
+  .auth-divider::before, .auth-divider::after{ content:''; flex:1; height:1px; background:var(--glass-border); }
+
+  .btn-x{
+    width:100%; padding:12px; border:1px solid var(--glass-border); border-radius:10px;
+    font-size:14px; font-weight:600; color:var(--text); background:#000; cursor:pointer;
+    display:flex; align-items:center; justify-content:center; gap:8px; transition:filter .2s;
+  }
+  .btn-x:hover{ filter:brightness(1.3); }
+  .btn-x svg{ width:16px; height:16px; }
+
+  /* Google's own brand guidance expects a light button with the colored G
+     mark, unlike X's black button above. */
+  .btn-google{
+    width:100%; padding:12px; border:1px solid var(--glass-border); border-radius:10px;
+    font-size:14px; font-weight:600; color:#3c4043; background:#fff; cursor:pointer;
+    display:flex; align-items:center; justify-content:center; gap:8px; transition:filter .2s;
+    margin-top:10px;
+  }
+  .btn-google:hover{ filter:brightness(0.97); }
+  .btn-google svg{ width:18px; height:18px; }
+
+  .error-msg{ color:var(--error); font-size:13px; margin-bottom:16px; text-align:center; display:none; }
+  .auth-footer{ margin-top:24px; text-align:center; font-size:13px; color:var(--text-dim); }
+  .auth-footer a{ color:var(--blue); font-weight:500; }
+  .auth-footer a:hover{ text-decoration:underline; }
+</style>
+</head>
+<body>
+
+<div class="bg-field"></div>
+
+<div class="auth-card">
+  <a href="/" class="logo">Streamflix<span class="logo-x">X</span></a>
+
+  <div id="errorBox" class="error-msg"></div>
+
+  <form id="loginForm">
+    <div class="form-group">
+      <label for="email">Email Address</label>
+      <input type="email" id="email" required placeholder="name@example.com" autocomplete="email" />
+    </div>
+
+    <div class="form-group">
+      <label for="password">Password</label>
+      <input type="password" id="password" required placeholder="••••••••" autocomplete="current-password" />
+    </div>
+
+    <button type="submit" class="btn-submit">Log In</button>
+  </form>
+
+  <div class="auth-divider">or</div>
+
+  <a href="/api/auth/x/start" class="btn-x">
+    <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
+    Continue with X
+  </a>
+
+  <a href="/api/auth/google/start" class="btn-google">
+    <svg viewBox="0 0 48 48" aria-hidden="true"><path fill="#4285F4" d="M45.12 24.5c0-1.56-.14-3.06-.4-4.5H24v8.51h11.84c-.51 2.75-2.06 5.08-4.39 6.64v5.52h7.11c4.16-3.83 6.56-9.47 6.56-16.17z"/><path fill="#34A853" d="M24 46c5.94 0 10.92-1.97 14.56-5.33l-7.11-5.52c-1.97 1.32-4.49 2.1-7.45 2.1-5.73 0-10.58-3.87-12.31-9.07H4.34v5.7C7.96 41.07 15.4 46 24 46z"/><path fill="#FBBC05" d="M11.69 28.18C11.25 26.86 11 25.45 11 24s.25-2.86.69-4.18v-5.7H4.34C2.85 17.09 2 20.45 2 24s.85 6.91 2.34 9.88l7.35-5.7z"/><path fill="#EA4335" d="M24 10.75c3.23 0 6.13 1.11 8.41 3.29l6.31-6.31C34.91 4.18 29.93 2 24 2 15.4 2 7.96 6.93 4.34 14.12l7.35 5.7c1.73-5.2 6.58-9.07 12.31-9.07z"/></svg>
+    Continue with Google
+  </a>
+
+  <div class="auth-footer">
+    Don't have an account? <a href="/signup.html">Sign Up</a>
+  </div>
+</div>
+
+<script>
+// Where to go after sign-in. Only a relative path on this site or one of our
+// own two hostnames is accepted; anything else (another domain, //host,
+// backslashes) is ignored, so ?redirect= can't be used to bounce people to a
+// look-alike site after they type their password.
+var SF_RETURN_TO = (function () {
+  var v = new URLSearchParams(window.location.search).get('redirect');
+  if (!v || v.length > 300) return null;
+  if (v.charAt(0) === '/' && v.charAt(1) !== '/' && v.charAt(1) !== '\\') return v;
+  try {
+    var u = new URL(v);
+    if (u.protocol === 'https:' && (u.origin === 'https://biggboss24hrs.com' || u.origin === 'https://episode.biggboss24hrs.com')) return u.toString();
+  } catch (e) {}
+  return null;
+})();
+
+// The X / Google buttons carry the return address through the OAuth round trip.
+if (SF_RETURN_TO) {
+  document.querySelectorAll('a[href^="/api/auth/"]').forEach(function (a) {
+    a.href = a.getAttribute('href') + '?return=' + encodeURIComponent(SF_RETURN_TO);
+  });
+}
+
+(function showOAuthError() {
+  const params = new URLSearchParams(window.location.search);
+  const xErr = params.get('x_error');
+  const gErr = params.get('g_error');
+  const banned = params.get('banned');
+  if (!xErr && !gErr && !banned) return;
+
+  let message;
+  if (banned) {
+    message = 'Your account has been suspended.';
+  } else if (xErr) {
+    const messages = {
+      full: 'The X sign-in beta is full right now — try again later.',
+      taken: 'That X handle can\'t be linked to an account right now.',
+      banned: 'This account is no longer able to sign in.',
+      '1': 'Something went wrong signing in with X. Please try again.'
+    };
+    message = messages[xErr] || messages['1'];
+  } else if (gErr === 'banned') {
+    message = 'This account is no longer able to sign in.';
+  } else if (gErr === 'domain') {
+    message = 'Google sign-in is only available for Gmail accounts.';
+  } else {
+    // Google's flow has no cap/eviction, so this is the only other failure case.
+    message = 'Something went wrong signing in with Google. Please try again.';
+  }
+
+  const errorBox = document.getElementById('errorBox');
+  errorBox.textContent = message;
+  errorBox.style.display = 'block';
+})();
+
+document.getElementById('loginForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const errorBox = document.getElementById('errorBox');
+  errorBox.style.display = 'none';
+
+  const email = document.getElementById('email').value.trim();
+  const password = document.getElementById('password').value;
+
+  try {
+    const res = await fetch('/api/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ email, password })
+    });
+
+    const data = await res.json();
+
+    if (res.ok) {
+      if (data.token) {
+        localStorage.setItem('token', data.token);
+      }
+      window.location.href = SF_RETURN_TO || '/live';
+    } else {
+      errorBox.textContent = data.error || 'Login failed';
+      errorBox.style.display = 'block';
+    }
+  } catch (err) {
+    errorBox.textContent = 'Unable to connect to authentication server';
+    errorBox.style.display = 'block';
+  }
+});
+</script>
+
+</body>
+</html>
